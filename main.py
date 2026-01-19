@@ -1,4 +1,4 @@
-import json
+import ssl
 import socket
 import signal
 import argparse
@@ -39,10 +39,13 @@ lsock.setblocking(False)
 
 sel.register(lsock, selectors.EVENT_READ, data=None)
 
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH) # use CLIENT_AUTH since i am in the role of the server itself
+context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
+
 def accept_connection(sock) -> None:
     conn, addr = sock.accept()
     conn.setblocking(False)
-    connection_context = ConnectionContext(sel, conn, addr)
+    connection_context = ConnectionContext(sel, conn, addr, context)
     sel.register(conn, selectors.EVENT_READ, data=connection_context)
     print(f'Accepted and registered connection from {addr}')
 
