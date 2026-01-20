@@ -1,2 +1,2 @@
-def parse_request(header: bytes) -> tuple[tuple[str, str, str], dict[str, str]]: # returns ((method, path, version), (headers, ...))
+def parse_request(header: bytes) -> tuple[str, dict[str, str]]: # returns (request top line, headers dict) in original casing
     ...

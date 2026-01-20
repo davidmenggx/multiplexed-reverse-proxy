@@ -3,9 +3,9 @@ import socket
 import selectors
 from enum import Enum
 
-from load_balancer import LoadBalancer
 from cache import Cache
-from utilities import parse_request
+from load_balancer import LoadBalancer
+from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response
 
 LOAD_BALANCER = LoadBalancer()
 
@@ -44,7 +44,8 @@ class ConnectionContext:
         self.request_content_length = 0 # implement max buffer size to prevent malicious attacks?
         self.response_content_length = 0
 
-        self.header_parsed = False
+        self.request_header_parsed = False
+        self.response_header_parsed = False
         
     
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
@@ -71,7 +72,7 @@ class ConnectionContext:
         """
         Reads from client_sock into request_buffer
         checks for header delimiter
-        if headers found -> parse -> check cache -> (connect backend or write client)
+        if request_headers found -> parse -> check cache -> (connect backend or write client)
         """
         try:
             data: bytes = self.client_sock.recv(4096)
@@ -85,35 +86,46 @@ class ConnectionContext:
             return
         
         if HEADER_DELIMITER in self.request_buffer:
-            if not self.header_parsed:
+            if not self.request_header_parsed:
                 request_head_raw, _, request_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
                 self.head_raw_length = len(request_head_raw)
 
-                ((self.method, self.path, self.version), self.headers) = parse_request(request_head_raw) # all will be returned in lowercase
+                self.request_line, self.request_headers = parse_request(request_head_raw) # this will be in the original casing
+
+                self.method, self.path = '' # FILL THIS IN
+
+                self.request_headers_lower = {key.lower(): value.lower() for key, value in self.request_headers}
+
+                # maybe do validation on the request version ? or not because right now i have no version
 
                 if message := CACHE.get_request(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
                     # maybe i need to do something like loading the message? what do i load to?
-                    self.state = ProcessingStates.WRITE_CLIENT
                     self.response_buffer = message
                     self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
+                    self.state = ProcessingStates.WRITE_CLIENT
                     return
 
                 try:
-                    self.request_content_length: int = int(self.headers.get('content-length', 0))
+                    self.request_content_length: int = int(self.request_headers.get('content-length', 0))
                 except Exception as e:
                     print(f'Could not parse content length: {e}')
                     return
                 
-                self.header_parsed = True
+                self.request_header_parsed = True
             
             if len(self.request_buffer) < self.head_raw_length + len(HEADER_DELIMITER) + self.request_content_length:
                 return # this means the message hasn't fully been read yet
-            else:
-                # reconstruct headers (add x-forward, x-proto, etc.)
-                self.state = ProcessingStates.CONNECT_BACKEND
-                if not self.backend_sock: # IMPORTANT: IF THE BACKEND SOCK ALR EXISTS, SKIP STRAIGHT TO WRITE_BACKEND
-                    self._init_backend_conn()
-                ... # this means the message has fully been read, move on to initializing the backend conn
+            
+            # moving past this part means the message has been fully read
+            
+            # reconstruct request_headers (add x-forward, x-proto, strip connection keep alive, etc.)
+            self.request_body = self.request_buffer[self.head_raw_length:]
+            self.request_buffer = reconstruct_request(self.request_line, self.request_headers, self.request_body)
+            
+            if not self.backend_sock: # IMPORTANT: IF THE BACKEND SOCK ALR EXISTS, SKIP STRAIGHT TO WRITE_BACKEND
+                self._init_backend_conn()
+            else: # backend socket could alr exist if we are keep aliving
+                self.state = ProcessingStates.WRITE_BACKEND
             
             # more logic here
     
@@ -123,31 +135,71 @@ class ConnectionContext:
         checks SO_ERROR
         if valid => update selector to write request -> state to WRITE_BACKEND
         """
-        ...
+        if self.backend_sock and not (error := self.backend_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)):
+            # if you reach this point, it means you have finished the connection to the backend
+            self.state = ProcessingStates.WRITE_BACKEND
+        else:
+            print(f'CRITICAL: Error occured when connecting to backend: {error}')
+            # at this point, either retry a new connection or buffer 502 bad gateway + set state to write client
+            return
     
     def _write_request(self) -> None:
         """
         Sends request_buffer to backend_sock
         if buffer empty -> update selector to read response -> state to READ_BACKEND
         """
-        ...
-        # if self.request_buffer:
-        #     try:
-        #         sent = self.client_sock.send(self.request_buffer) # .send returns the # of bytes sent
-        #         self.request_buffer = self.request_buffer[sent:] # so use that info to clear the buffer
-        #     except BlockingIOError:
-        #         pass
+        if self.backend_sock and self.request_buffer:
+            try:
+                sent = self.backend_sock.send(self.request_buffer) # .send returns the # of bytes sent
+                if not sent:
+                    return # CRITICAL: THIS IS AN ERROR, IT MEANS THE BACKEND HAS NOT BEEN CONNECTED
+                self.request_buffer = self.request_buffer[sent:] # so use that info to clear the buffer
+            except BlockingIOError:
+                pass
         
-        # if not self.request_buffer:
-        #     self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self) # if everything is sent, change back to EVENT_READ to avoid excessively pinging
+        if self.backend_sock and not self.request_buffer:
+            self.selector.modify(self.backend_sock, selectors.EVENT_READ, data=self) # if everything is sent, change back to EVENT_READ to avoid excessively pinging
+            self.state = ProcessingStates.READ_BACKEND
 
     def _read_response(self) -> None:
         """
         Reads from backend_sock into response_buffer
-        parses headers for Content-Length
+        parses request_headers for Content-Length
         if full body received -> close backend -> state to WRITE_CLEINT
         """
-        ...
+        try:
+            data: bytes = self.client_sock.recv(4096)
+        except BlockingIOError: # if for some reason no data is found, do nothing
+            return
+        
+        if data:
+            self.response_buffer += data
+        else: # DO I NEED THIS LINE?
+            self._close()
+            return
+        
+        if HEADER_DELIMITER in self.request_buffer:
+            if not self.response_header_parsed:
+                response_head_raw, _, response_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
+                self.head_raw_length = len(response_head_raw)
+
+                self.response_line, self.response_headers = parse_response(response_head_raw)
+
+                try:
+                    self.response_content_length: int = int(self.response_headers.get('content-length', 0))
+                except Exception as e:
+                    print(f'Could not parse content length: {e}')
+                    return
+                
+                self.response_header_parsed = True
+            
+            # after the response has been loaded:
+            # look up content length and make sure it has been loaded fully
+            self.response_body = b'' # FILL THIS IN DYNAMICALLY
+            # think about gzipping (look up accept-encoding)
+            # think about caching (loop up cache-control)
+            # if no compression, just return the response buffer, otherwise i will need to reconstruct it
+            self.response_buffer = reconstruct_response(self.response_line, self.response_headers, self.response_body)
 
     def _write_client(self):
         """
@@ -165,19 +217,16 @@ class ConnectionContext:
         pauses client_sock (unregister or remove selectors.EVENT_READ) to stop buffering
         """
         self.backend_addr = LOAD_BALANCER._get_server_one() # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
+        if not self.backend_addr:
+            ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
+        
+        self.state = ProcessingStates.CONNECT_BACKEND
         self.backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.backend_sock.setblocking(False)
         self.backend_sock.connect_ex(self.backend_addr)
+
         self.selector.register(self.backend_sock, selectors.EVENT_WRITE, data=self)
         self.selector.unregister(self.client_sock)
-
-
-    def _check_cache(self):
-        """
-        Checks cache for current request
-        if hit -> Fill response_buffer -> state changes directly to WRITE_CLIENT
-        """
-        ...
 
     def _close(self) -> None:
         try:
