@@ -206,7 +206,18 @@ class ConnectionContext:
         Sends response_buffer to client_sock
         if buffer empty -> state to CLEANUP
         """
-        ...
+        if self.client_sock and self.response_buffer:
+            try:
+                sent = self.client_sock.send(self.response_buffer) # .send returns the # of bytes sent
+                if not sent:
+                    return # CRITICAL: THIS IS AN ERROR, IT MEANS THE BACKEND HAS NOT BEEN CONNECTED
+                self.response_buffer = self.response_buffer[sent:] # so use that info to clear the buffer
+            except BlockingIOError:
+                pass
+        
+        if self.client_sock and not self.response_buffer:
+            self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self) # if everything is sent, change back to EVENT_READ to avoid excessively pinging
+            self.state = ProcessingStates.CLEANUP
 
     def _init_backend_conn(self):
         """
