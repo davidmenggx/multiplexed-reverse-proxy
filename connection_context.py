@@ -183,7 +183,10 @@ class ConnectionContext:
                 response_head_raw, _, response_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
                 self.head_raw_length = len(response_head_raw)
 
-                self.response_line, self.response_headers = parse_response(response_head_raw)
+                try:
+                    self.response_line, self.response_headers = parse_response(response_head_raw)
+                except ValueError:
+                    return # CRITICAL: COULD NOT PARSE ERROR 400 BAD REQUEST
 
                 try:
                     self.response_content_length: int = int(self.response_headers.get('content-length', 0))
