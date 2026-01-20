@@ -88,16 +88,14 @@ class ConnectionContext:
         if HEADER_DELIMITER in self.request_buffer:
             if not self.request_header_parsed:
                 request_head_raw, _, request_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
-                self.head_raw_length = len(request_head_raw)
+                self.request_head_raw_length = len(request_head_raw)
 
                 try:
-                    self.request_line, self.request_headers = parse_request(request_head_raw) # this will be in the original casing
+                    request_line, request_headers = parse_request(request_head_raw) # this will be in the original casing
                 except ValueError:
                     return # CRITICAL: COULD NOT PARSE ERROR 400 BAD REQUEST
                 
-                self.method, self.path = self.request_line.split()[:2]
-
-                self.request_headers_lower = {key.lower(): value.lower() for key, value in self.request_headers}
+                self.method, self.path = request_line.split()[:2]
 
                 # maybe do validation on the request version ? or not because right now i have no version
 
@@ -108,28 +106,40 @@ class ConnectionContext:
                     self.state = ProcessingStates.WRITE_CLIENT
                     return
 
+                request_headers_lower = {key.lower(): value.lower() for key, value in request_headers}
+
                 try:
-                    self.request_content_length: int = int(self.request_headers_lower.get('content-length', 0))
+                    self.request_content_length: int = int(request_headers_lower.get('content-length', 0))
                 except Exception as e:
                     print(f'Could not parse content length: {e}')
                     return
                 
                 self.request_header_parsed = True
             
-            if len(self.request_buffer) < self.head_raw_length + len(HEADER_DELIMITER) + self.request_content_length:
+            if len(self.request_buffer) < self.request_head_raw_length + len(HEADER_DELIMITER) + self.request_content_length:
                 return # this means the message hasn't fully been read yet
             
             # moving past this part means the message has been fully read
             
             # reconstruct request_headers (add x-forward, x-proto, strip connection keep alive, etc.)
-            self.request_body = self.request_buffer[self.head_raw_length:]
-            self.request_buffer = reconstruct_request(self.request_line, self.request_headers, self.request_body)
+            request_headers['X-Forwarded-For'] = f'{self.client_addr[0].replace("'", '')}' # type: ignore
+            request_headers['X-Forwarded-Proto'] = 'https'
+
+            if 'connection' in request_headers_lower:
+                self.keepalive = True if request_headers_lower.get('connection') != 'close' else False
+                _request_connection_key = next(k for k in request_headers if k.lower() == 'connection')
+                request_headers.pop(_request_connection_key)
+                request_headers_lower.pop('connection')
+
+            request_body = self.request_buffer[self.request_head_raw_length + len(HEADER_DELIMITER):]
+            self.request_buffer = reconstruct_request(request_line, request_headers, request_body)
             
             if not self.backend_sock: # IMPORTANT: IF THE BACKEND SOCK ALR EXISTS, SKIP STRAIGHT TO WRITE_BACKEND
                 self._init_backend_conn()
             else: # backend socket could alr exist if we are keep aliving
+                self.selector.modify(self.backend_sock, selectors.EVENT_WRITE, data=self)
+                self.selector.unregister(self.client_sock)
                 self.state = ProcessingStates.WRITE_BACKEND
-            
             # more logic here
     
     def _finish_connection(self) -> None:
@@ -167,7 +177,7 @@ class ConnectionContext:
     def _read_response(self) -> None:
         """
         Reads from backend_sock into response_buffer
-        parses request_headers for Content-Length
+        parses response_headers for Content-Length
         if full body received -> close backend -> state to WRITE_CLEINT
         """
         try:
@@ -181,17 +191,17 @@ class ConnectionContext:
             self._close()
             return
         
-        if HEADER_DELIMITER in self.request_buffer:
+        if HEADER_DELIMITER in self.response_buffer:
             if not self.response_header_parsed:
-                response_head_raw, _, response_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
-                self.head_raw_length = len(response_head_raw)
+                response_head_raw, _, response_remaining_bytes = self.response_buffer.partition(HEADER_DELIMITER)
+                self.response_head_raw_length = len(response_head_raw)
 
                 try:
                     self.response_line, self.response_headers = parse_response(response_head_raw)
                 except ValueError:
                     return # CRITICAL: COULD NOT PARSE ERROR INTERNAL SERVER ERROR
                 
-                self.response_headers_lower = {key.lower(): value.lower() for key, value in self.response_headers}
+                self.response_headers_lower = {key.lower(): value.lower() for key, value in self.response_headers} # you need self here since you'll check it again for gzipping/cache
 
                 try:
                     self.response_content_length: int = int(self.response_headers_lower.get('content-length', 0))
