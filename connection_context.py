@@ -90,9 +90,12 @@ class ConnectionContext:
                 request_head_raw, _, request_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
                 self.head_raw_length = len(request_head_raw)
 
-                self.request_line, self.request_headers = parse_request(request_head_raw) # this will be in the original casing
-
-                self.method, self.path = '' # FILL THIS IN
+                try:
+                    self.request_line, self.request_headers = parse_request(request_head_raw) # this will be in the original casing
+                except ValueError:
+                    return # CRITICAL: COULD NOT PARSE ERROR 400 BAD REQUEST
+                
+                self.method, self.path = self.request_line.split()[:2]
 
                 self.request_headers_lower = {key.lower(): value.lower() for key, value in self.request_headers}
 
@@ -106,7 +109,7 @@ class ConnectionContext:
                     return
 
                 try:
-                    self.request_content_length: int = int(self.request_headers.get('content-length', 0))
+                    self.request_content_length: int = int(self.request_headers_lower.get('content-length', 0))
                 except Exception as e:
                     print(f'Could not parse content length: {e}')
                     return
@@ -186,10 +189,12 @@ class ConnectionContext:
                 try:
                     self.response_line, self.response_headers = parse_response(response_head_raw)
                 except ValueError:
-                    return # CRITICAL: COULD NOT PARSE ERROR 400 BAD REQUEST
+                    return # CRITICAL: COULD NOT PARSE ERROR INTERNAL SERVER ERROR
+                
+                self.response_headers_lower = {key.lower(): value.lower() for key, value in self.response_headers}
 
                 try:
-                    self.response_content_length: int = int(self.response_headers.get('content-length', 0))
+                    self.response_content_length: int = int(self.response_headers_lower.get('content-length', 0))
                 except Exception as e:
                     print(f'Could not parse content length: {e}')
                     return

@@ -11,7 +11,7 @@ def parse_request(header: bytes) -> tuple[str, dict[str, str]]: # returns (reque
         _header = h.split(b': ')
 
         if len(_header) != 2:
-            raise ValueError('Parse Error - Headers')
+            raise ValueError('Parse Error - Request Headers')
         
         request_headers_raw_dict[_header[0]] = _header[1]
     

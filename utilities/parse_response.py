@@ -8,7 +8,7 @@ def parse_response(header: bytes) -> tuple[str, dict[str, str]]: # returns (resp
         _header = h.split(b': ')
 
         if len(_header) != 2:
-            raise ValueError('Parse Error - Headers')
+            raise ValueError('Parse Error - Response Headers')
         
         response_headers_raw_dict[_header[0]] = _header[1]
     
