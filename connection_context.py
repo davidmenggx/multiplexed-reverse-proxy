@@ -4,8 +4,14 @@ import selectors
 from enum import Enum
 
 from load_balancer import LoadBalancer
+from cache import Cache
+from utilities import parse_request
 
 LOAD_BALANCER = LoadBalancer()
+
+CACHE = Cache()
+
+HEADER_DELIMITER = b'\r\n\r\n'
 
 class ProcessingStates(Enum):
     READ_REQUEST = 'READ_REQUEST'
@@ -14,6 +20,9 @@ class ProcessingStates(Enum):
     READ_BACKEND = 'READ_BACKEND'
     WRITE_CLIENT = 'WRITE_CLIENT'
     CLEANUP = 'CLEANUP'
+
+# FOR KEEPALIVE, MAKE IT SO THAT INSTEAD OF GOING FROM WRITE_CLIENT => CLEANUP, MAKE IT LOOP BACK TO READ_REQUEST
+# THEN RESET ALL OF THE BUFFERS, BUT DO NOT RESET THE SOCKETS
 
 class ConnectionContext:
     def __init__(self, selector: selectors.BaseSelector, 
@@ -26,14 +35,16 @@ class ConnectionContext:
         self.client_addr: socket.AddressFamily = addr
 
         self.backend_sock: socket.socket | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
-        self.backend_addr: socket.socket | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
+        self.backend_addr: tuple | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
 
         self.state = ProcessingStates.READ_REQUEST
         self.request_buffer: bytes = b''
         self.response_buffer: bytes = b''
 
-        self.request_content_length = 0
+        self.request_content_length = 0 # implement max buffer size to prevent malicious attacks?
         self.response_content_length = 0
+
+        self.header_parsed = False
         
     
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
@@ -62,17 +73,49 @@ class ConnectionContext:
         checks for header delimiter
         if headers found -> parse -> check cache -> (connect backend or write client)
         """
-        ...
-        # try:
-        #     data: bytes = self.client_sock.recv(4096)
-        # except BlockingIOError: # if for some reason no data is found, do nothing
-        #     return
+        try:
+            data: bytes = self.client_sock.recv(4096)
+        except BlockingIOError: # if for some reason no data is found, do nothing
+            return
         
-        # if data:
-        #     self.request_buffer += data
-        #     self.selector.modify(self.client_sock, selectors.EVENT_READ | selectors.EVENT_WRITE, data=self) # if there is data to write, update the selector accordingly
-        # else: # no data = end of connection, so close
-        #     self._close()
+        if data:
+            self.request_buffer += data
+        else: # no data = end of connection, so close
+            self._close()
+            return
+        
+        if HEADER_DELIMITER in self.request_buffer:
+            if not self.header_parsed:
+                request_head_raw, _, request_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
+                self.head_raw_length = len(request_head_raw)
+
+                ((self.method, self.path, self.version), self.headers) = parse_request(request_head_raw) # all will be returned in lowercase
+
+                if message := CACHE.get_request(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
+                    # maybe i need to do something like loading the message? what do i load to?
+                    self.state = ProcessingStates.WRITE_CLIENT
+                    self.response_buffer = message
+                    self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
+                    return
+
+                try:
+                    self.request_content_length: int = int(self.headers.get('content-length', 0))
+                except Exception as e:
+                    print(f'Could not parse content length: {e}')
+                    return
+                
+                self.header_parsed = True
+            
+            if len(self.request_buffer) < self.head_raw_length + len(HEADER_DELIMITER) + self.request_content_length:
+                return # this means the message hasn't fully been read yet
+            else:
+                # reconstruct headers (add x-forward, x-proto, etc.)
+                self.state = ProcessingStates.CONNECT_BACKEND
+                if not self.backend_sock: # IMPORTANT: IF THE BACKEND SOCK ALR EXISTS, SKIP STRAIGHT TO WRITE_BACKEND
+                    self._init_backend_conn()
+                ... # this means the message has fully been read, move on to initializing the backend conn
+            
+            # more logic here
     
     def _finish_connection(self) -> None:
         """
@@ -113,7 +156,7 @@ class ConnectionContext:
         """
         ...
 
-    def _initiate_backend_connection(self):
+    def _init_backend_conn(self):
         """
         Asks Load Balancer for an address
         creates socket, sets non-blocking
@@ -121,7 +164,13 @@ class ConnectionContext:
         registers backend_sock with Selector (WRITE_BACKEND), passing self as data
         pauses client_sock (unregister or remove selectors.EVENT_READ) to stop buffering
         """
-        ...
+        self.backend_addr = LOAD_BALANCER._get_server_one() # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
+        self.backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.backend_sock.setblocking(False)
+        self.backend_sock.connect_ex(self.backend_addr)
+        self.selector.register(self.backend_sock, selectors.EVENT_WRITE, data=self)
+        self.selector.unregister(self.client_sock)
+
 
     def _check_cache(self):
         """
