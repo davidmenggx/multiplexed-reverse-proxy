@@ -14,6 +14,7 @@ CACHE = Cache()
 HEADER_DELIMITER = b'\r\n\r\n'
 
 class ProcessingStates(Enum):
+    SSL_HANDSHAKE = 'SSL_HANDSHAKE'
     READ_REQUEST = 'READ_REQUEST'
     CONNECT_BACKEND = 'CONNECT_BACKEND'
     WRITE_BACKEND = 'WRITE_BACKEND'
@@ -26,18 +27,17 @@ class ProcessingStates(Enum):
 
 class ConnectionContext:
     def __init__(self, selector: selectors.BaseSelector, 
-                sock: socket.socket, 
-                addr: socket.AddressFamily,
-                context: ssl.SSLContext) -> None:
+                sock: ssl.SSLSocket, 
+                addr: socket.AddressFamily) -> None:
         self.selector: selectors.BaseSelector = selector
 
-        self.client_sock: ssl.SSLSocket = context.wrap_socket(sock, server_side=True) # server side = True is needed for the server handshake
+        self.client_sock: ssl.SSLSocket = sock
         self.client_addr: socket.AddressFamily = addr
 
         self.backend_sock: socket.socket | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
         self.backend_addr: tuple | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
 
-        self.state = ProcessingStates.READ_REQUEST
+        self.state = ProcessingStates.SSL_HANDSHAKE
         self.request_buffer: bytes = b''
         self.response_buffer: bytes = b''
 
@@ -50,6 +50,8 @@ class ConnectionContext:
     
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
         match (self.state, mask):
+            case (ProcessingStates.SSL_HANDSHAKE, m) if m & (selectors.EVENT_READ | selectors.EVENT_WRITE):
+                self._handshake()
             case (ProcessingStates.READ_REQUEST, m) if m & selectors.EVENT_READ:
                 self._read_request()
 
@@ -68,15 +70,28 @@ class ConnectionContext:
         if self.state == ProcessingStates.CLEANUP:
             self._close()
     
+    def _handshake(self) -> None:
+        print('starting TLS handshake')
+        try:
+            self.client_sock.do_handshake()
+        except ssl.SSLWantReadError:
+            self.selector.modify(self.client_sock, selectors.EVENT_READ, self)
+        except ssl.SSLWantWriteError:
+            self.selector.modify(self.client_sock, selectors.EVENT_WRITE, self)
+        except Exception as e:
+            print(f'An unexpected exception occurred on TLS handshake: {e}')
+        self.state = ProcessingStates.READ_REQUEST
+    
     def _read_request(self) -> None:
         """
         Reads from client_sock into request_buffer
         checks for header delimiter
         if request_headers found -> parse -> check cache -> (connect backend or write client)
         """
+        print('reading request')
         try:
             data: bytes = self.client_sock.recv(4096)
-        except BlockingIOError: # if for some reason no data is found, do nothing
+        except (BlockingIOError, ssl.SSLWantReadError): # if for some reason no data is found, do nothing
             return
         
         if data:
@@ -105,8 +120,8 @@ class ConnectionContext:
                     self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
                     self.state = ProcessingStates.WRITE_CLIENT
                     return
-
-                request_headers_lower = {key.lower(): value.lower() for key, value in request_headers}
+                
+                request_headers_lower = {key.lower(): value.lower() for key, value in request_headers.items()}
 
                 try:
                     self.request_content_length: int = int(request_headers_lower.get('content-length', 0))
@@ -115,6 +130,7 @@ class ConnectionContext:
                     return
                 
                 self.request_header_parsed = True
+                print('finished parsing header')
             
             if len(self.request_buffer) < self.request_head_raw_length + len(HEADER_DELIMITER) + self.request_content_length:
                 return # this means the message hasn't fully been read yet
@@ -141,6 +157,8 @@ class ConnectionContext:
                 self.selector.unregister(self.client_sock)
                 self.state = ProcessingStates.WRITE_BACKEND
             # more logic here
+
+            print(self.request_buffer)
     
     def _finish_connection(self) -> None:
         """
@@ -148,6 +166,7 @@ class ConnectionContext:
         checks SO_ERROR
         if valid => update selector to write request -> state to WRITE_BACKEND
         """
+        print('finishing connection')
         if self.backend_sock and not (error := self.backend_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)):
             # if you reach this point, it means you have finished the connection to the backend
             self.state = ProcessingStates.WRITE_BACKEND
@@ -161,6 +180,7 @@ class ConnectionContext:
         Sends request_buffer to backend_sock
         if buffer empty -> update selector to read response -> state to READ_BACKEND
         """
+        print('writing request')
         if self.backend_sock and self.request_buffer:
             try:
                 sent = self.backend_sock.send(self.request_buffer) # .send returns the # of bytes sent
@@ -180,8 +200,10 @@ class ConnectionContext:
         parses response_headers for Content-Length
         if full body received -> close backend -> state to WRITE_CLEINT
         """
+        print('reading response')
         try:
-            data: bytes = self.client_sock.recv(4096)
+            if self.backend_sock:
+                data: bytes = self.backend_sock.recv(4096)
         except BlockingIOError: # if for some reason no data is found, do nothing
             return
         
@@ -201,7 +223,7 @@ class ConnectionContext:
                 except ValueError:
                     return # CRITICAL: COULD NOT PARSE ERROR INTERNAL SERVER ERROR
                 
-                self.response_headers_lower = {key.lower(): value.lower() for key, value in self.response_headers} # you need self here since you'll check it again for gzipping/cache
+                self.response_headers_lower = {key.lower(): value.lower() for key, value in self.response_headers.items()} # you need self here since you'll check it again for gzipping/cache
 
                 try:
                     self.response_content_length: int = int(self.response_headers_lower.get('content-length', 0))
@@ -210,7 +232,7 @@ class ConnectionContext:
                     return
                 
                 self.response_header_parsed = True
-            
+
             # after the response has been loaded:
             # look up content length and make sure it has been loaded fully
             self.response_body = b'' # FILL THIS IN DYNAMICALLY
@@ -218,12 +240,14 @@ class ConnectionContext:
             # think about caching (loop up cache-control)
             # if no compression, just return the response buffer, otherwise i will need to reconstruct it
             self.response_buffer = reconstruct_response(self.response_line, self.response_headers, self.response_body)
+            print(self.response_buffer)
 
     def _write_client(self):
         """
         Sends response_buffer to client_sock
         if buffer empty -> state to CLEANUP
         """
+        print('writing client')
         if self.client_sock and self.response_buffer:
             try:
                 sent = self.client_sock.send(self.response_buffer) # .send returns the # of bytes sent
@@ -245,6 +269,7 @@ class ConnectionContext:
         registers backend_sock with Selector (WRITE_BACKEND), passing self as data
         pauses client_sock (unregister or remove selectors.EVENT_READ) to stop buffering
         """
+        print('initializing backend connection')
         self.backend_addr = LOAD_BALANCER._get_server_one() # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
         if not self.backend_addr:
             ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
@@ -258,6 +283,7 @@ class ConnectionContext:
         self.selector.unregister(self.client_sock)
 
     def _close(self) -> None:
+        print('closing down connection')
         try:
             if self.client_sock:
                 try:

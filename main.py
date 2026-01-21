@@ -44,9 +44,14 @@ context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
 
 def accept_connection(sock) -> None:
     conn, addr = sock.accept()
-    conn.setblocking(False)
-    connection_context = ConnectionContext(sel, conn, addr, context)
-    sel.register(conn, selectors.EVENT_READ, data=connection_context)
+    
+    ssl_conn = context.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
+    ssl_conn.setblocking(False)
+    
+    connection_context = ConnectionContext(sel, ssl_conn, addr)
+    
+    sel.register(ssl_conn, selectors.EVENT_READ, data=connection_context)
+    
     print(f'Accepted and registered connection from {addr}')
 
 def main() -> None:
