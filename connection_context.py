@@ -14,7 +14,7 @@ CACHE = Cache()
 HEADER_DELIMITER = b'\r\n\r\n'
 
 class ProcessingStates(Enum):
-    SSL_HANDSHAKE = 'SSL_HANDSHAKE'
+    TLS_HANDSHAKE = 'TLS_HANDSHAKE'
     READ_REQUEST = 'READ_REQUEST'
     CONNECT_BACKEND = 'CONNECT_BACKEND'
     WRITE_BACKEND = 'WRITE_BACKEND'
@@ -37,7 +37,7 @@ class ConnectionContext:
         self.backend_sock: socket.socket | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
         self.backend_addr: tuple | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
 
-        self.state = ProcessingStates.SSL_HANDSHAKE
+        self.state = ProcessingStates.TLS_HANDSHAKE
         self.request_buffer: bytes = b''
         self.response_buffer: bytes = b''
 
@@ -50,7 +50,7 @@ class ConnectionContext:
     
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
         match (self.state, mask):
-            case (ProcessingStates.SSL_HANDSHAKE, m) if m & (selectors.EVENT_READ | selectors.EVENT_WRITE):
+            case (ProcessingStates.TLS_HANDSHAKE, m) if m & (selectors.EVENT_READ | selectors.EVENT_WRITE):
                 self._handshake()
             case (ProcessingStates.READ_REQUEST, m) if m & selectors.EVENT_READ:
                 self._read_request()
