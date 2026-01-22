@@ -48,14 +48,24 @@ class LoadBalancer:
         ip_hash_server = self.servers_list[index]
         return ip_hash_server
     
-    def _add_server(self) -> None: # there need to parms here too
-        ...
+    def _add_server(self, server: tuple[str, int]) -> None: # there need to parms here too
+        self.servers_dict[server] = 0
+        self.servers_list = list(self.servers_dict.keys())
+    
+    def _remove_server(self, server: tuple[str, int]) -> None:
+        try:
+            del self.servers_dict[server]
+            self.servers_list = list(self.servers_dict.keys())
+        except KeyError:
+            print('FATAL: Server specified does not exist')
+        except Exception as e:
+            print(f'FATAL: an error occurred while deleting server {server}: {e}')
     
     def _increment_connection(self, server: tuple[str, int]) -> None:
         try:
             self.servers_dict[server] += 1
         except KeyError:
-            print('FATAL: Incorrect server specified')
+            print('FATAL: Server specified does not exist')
         except Exception as e:
             print(f'FATAL: an error occurred while incrementing server connection count: {e}')
     
@@ -66,7 +76,7 @@ class LoadBalancer:
                 self.servers_dict[server] = 0
                 print(f'FATAL: server {server} reached negative connections')
         except KeyError:
-            print('FATAL: Incorrect server specified')
+            print('FATAL: Server specified does not exist')
         except Exception as e:
             print(f'FATAL: an error occurred while decrementing server connection count: {e}')
 
@@ -106,3 +116,13 @@ if __name__ == '__main__':
     print(testing_load_balancer.servers_dict)
     testing_load_balancer._decrement_connection(('127.0.0.1', 8080))
     print(testing_load_balancer.servers_dict)
+
+    print('-------')
+    testing_load_balancer._add_server(('1.2.3.4', 8080))
+    print(testing_load_balancer.servers_dict)
+    print(testing_load_balancer.servers_list)
+
+    print('-------')
+    testing_load_balancer._remove_server(('1.2.3.4', 8080))
+    print(testing_load_balancer.servers_dict)
+    print(testing_load_balancer.servers_list)
