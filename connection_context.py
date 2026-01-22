@@ -35,7 +35,7 @@ class ConnectionContext:
         self.client_addr: socket.AddressFamily = addr
 
         self.backend_sock: socket.socket | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
-        self.backend_addr: tuple | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
+        self.backend_addr: tuple[str, int] | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
 
         self.state = ProcessingStates.TLS_HANDSHAKE
         self.request_buffer: bytes = b''
@@ -270,7 +270,9 @@ class ConnectionContext:
         pauses client_sock (unregister or remove selectors.EVENT_READ) to stop buffering
         """
         print('initializing backend connection')
-        self.backend_addr = LOAD_BALANCER._get_server_one() # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
+        # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
+        self.backend_addr = LOAD_BALANCER._get_server_one(self.client_addr[0]) # type: ignore
+        LOAD_BALANCER._increment_connection(self.backend_addr)
         if not self.backend_addr:
             ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
         
@@ -297,5 +299,7 @@ class ConnectionContext:
                 except KeyError: 
                     pass
                 self.backend_sock.close()
+            if self.backend_addr:
+                LOAD_BALANCER._decrement_connection(self.backend_addr)
         except Exception as e:
             print(f'error during close: {e}')
