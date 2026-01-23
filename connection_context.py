@@ -7,8 +7,6 @@ from cache import Cache
 from load_balancer import LoadBalancer
 from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response
 
-LOAD_BALANCER = LoadBalancer()
-
 CACHE = Cache()
 
 HEADER_DELIMITER = b'\r\n\r\n'
@@ -46,8 +44,9 @@ class ConnectionContext:
 
         self.request_header_parsed = False
         self.response_header_parsed = False
-        
-    
+
+        self.LOAD_BALANCER = LoadBalancer()
+
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
         match (self.state, mask):
             case (ProcessingStates.TLS_HANDSHAKE, m) if m & (selectors.EVENT_READ | selectors.EVENT_WRITE):
@@ -271,8 +270,13 @@ class ConnectionContext:
         """
         print('initializing backend connection')
         # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
-        self.backend_addr = LOAD_BALANCER._get_server_one(self.client_addr[0]) # type: ignore
-        LOAD_BALANCER._increment_connection(self.backend_addr)
+        try:
+            self.backend_addr = self.LOAD_BALANCER.get_server(self.client_addr[0]) # type: ignore
+            print(f'Got server: {self.backend_addr}')
+        except ValueError:
+            print('CRITICAL: Failed to find backend server')
+            return
+        self.LOAD_BALANCER._increment_connection(self.backend_addr)
         if not self.backend_addr:
             ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
         
@@ -300,6 +304,6 @@ class ConnectionContext:
                     pass
                 self.backend_sock.close()
             if self.backend_addr:
-                LOAD_BALANCER._decrement_connection(self.backend_addr)
+                self.LOAD_BALANCER._decrement_connection(self.backend_addr)
         except Exception as e:
             print(f'error during close: {e}')

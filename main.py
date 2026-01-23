@@ -4,15 +4,24 @@ import signal
 import argparse
 import selectors
 
+from load_balancer import LoadBalancer
 from connection_context import ConnectionContext
 
 parser = argparse.ArgumentParser(description="Configs for multiplexed reverse proxy")
 parser.add_argument('-p', '--port', type=int, default=8443, help='Port for server to run on')
+parser.add_argument('-l', '--loadalg', type=str, default='LEAST_CONNECTIONS', help='Choose a load balancing algorithm. Valid options: "LEAST_CONNECTIONS" (default), "IP_HASH", "RANDOM", "ROUND_ROBIN"')
 
 args = parser.parse_args()
 
 HOST = ''
 PORT = args.port
+
+LOAD_BALANCING_ALGORITHM = args.loadalg.upper() 
+if LOAD_BALANCING_ALGORITHM not in {'IP_HASH', 'LEAST_CONNECTIONS', 'RANDOM', 'ROUND_ROBIN'}:
+    print(f'Error: specified load balancing algorithm {args.loadalg} does not exist, defaulting to least connections')
+    LOAD_BALANCING_ALGORITHM = 'LEAST_CONNECTIONS'
+
+LOAD_BALANCER = LoadBalancer(algorithm=LOAD_BALANCING_ALGORITHM)
 
 RUNNING = True
 

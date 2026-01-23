@@ -1,4 +1,3 @@
-import ast
 import json
 import random
 import hashlib
@@ -6,41 +5,66 @@ import hashlib
 SERVERS_FILEPATH = 'servers.json'
 
 class LoadBalancer:
-    def __init__(self) -> None:
-        try:
-            with open(SERVERS_FILEPATH, 'r') as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            print(f"Error: The servers config file {SERVERS_FILEPATH} was not found.")
-        except Exception as e:
-            print(f"An error occurred: {e}")
+    _instance = None
+    _initialized = False
 
-        # store each server as a (IP, PORT tuple) mapped to # connections
-        self.servers_dict = {ast.literal_eval(s): 0 for s in data["servers"]} # parse the python tuples into str and int
-        self.servers_list = list(self.servers_dict.keys())
-        self.ROUND_ROBIN_COUNTER = 0
-    
-    def _get_server_one(self, _) -> tuple[str, int]: # type: ignore
-        # experimental for testing
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super(LoadBalancer, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self, algorithm: str | None = None) -> None:
+        if self._initialized:
+            return
+        
+        self.algorithm = algorithm or 'LEAST_CONNECTIONS'
+
         try:
-            return self.servers_list[0]
-        except KeyError:
-            print('Could not fetch a server')
+            with open('servers.json', 'r') as f:
+                data = json.load(f)
+
+            self.servers_list = [
+                (s['ip'], s['port']) for s in data['servers']
+            ]
+            self.servers_dict = {server: 0 for server in self.servers_list}
+
+            self.ROUND_ROBIN_COUNTER = 0
+            
+            self.__class__._initialized = True
+            print(self.servers_list)
+        except KeyError as e:
+            print(f'Error: Missing expected key in JSON: {e}')
+        except Exception as e:
+            print(f'Initialization failed: {e}')
+
+    def get_server(self, ip: str) -> tuple[str, int]:
+        match self.algorithm:
+            case 'LEAST_CONNECTIONS':
+                return self._get_least_connections_server(None)
+            case 'RANDOM':
+                return self._get_random_server(None)
+            case 'IP_HASH':
+                return self._get_ip_hash_server(ip)
+            case 'ROUND_ROBIN':
+                return self._get_round_robin_server(None)
+            case _:
+                print(f'Fatal: get server failed due to unknown load balancing algorithm: {self.algorithm}')
+                raise ValueError
     
-    def _get_round_robin(self, _) -> tuple[str, int]:
+    def _get_round_robin_server(self, _) -> tuple[str, int]:
         round_robin_server = self.servers_list[self.ROUND_ROBIN_COUNTER%len(self.servers_list)]
         self.ROUND_ROBIN_COUNTER += 1
         return round_robin_server
     
-    def _get_random(self, _) -> tuple[str, int]:
+    def _get_random_server(self, _) -> tuple[str, int]:
         random_server = random.choice(self.servers_list)
         return random_server
 
-    def _get_least_connections(self, _) -> tuple[str, int]:
+    def _get_least_connections_server(self, _) -> tuple[str, int]:
         least_connections_server = min(self.servers_dict, key=self.servers_dict.get) # type: ignore
         return least_connections_server
 
-    def _get_ip_hash(self, ip: str) -> tuple[str, int]:
+    def _get_ip_hash_server(self, ip: str) -> tuple[str, int]:
         hash_object = hashlib.md5(ip.encode()) # deterministic hashing, no salt. good
         hash_hex = hash_object.hexdigest()
 
@@ -83,30 +107,30 @@ class LoadBalancer:
 if __name__ == '__main__':
     sample_addr = ('127.0.0.1', 8000)
 
-    testing_load_balancer = LoadBalancer()
+    testing_load_balancer = LoadBalancer('LEAST_CONNECTIONS')
     print(f'All servers: {testing_load_balancer.servers_dict}')
 
     print('-------')
     
-    random_server = testing_load_balancer._get_random(sample_addr[0])
+    random_server = testing_load_balancer._get_random_server(sample_addr[0])
     print(f'Random server: {random_server}')
 
     print('-------')
     
-    round_robin_1 = testing_load_balancer._get_round_robin(sample_addr[0])
+    round_robin_1 = testing_load_balancer._get_round_robin_server(sample_addr[0])
     print(f'Round Robin server 1: {round_robin_1}')
 
-    round_robin_2 = testing_load_balancer._get_round_robin(sample_addr[0])
+    round_robin_2 = testing_load_balancer._get_round_robin_server(sample_addr[0])
     print(f'Round Robin server 2: {round_robin_2}')
 
     print('-------')
     
-    least_conn_server = testing_load_balancer._get_least_connections(sample_addr[0])
+    least_conn_server = testing_load_balancer._get_least_connections_server(sample_addr[0])
     print(f'Least connections server: {least_conn_server}')
 
     print('-------')
     
-    ip_hash_server = testing_load_balancer._get_ip_hash(sample_addr[0])
+    ip_hash_server = testing_load_balancer._get_ip_hash_server(sample_addr[0])
     print(f'IP hash server for {sample_addr}: {ip_hash_server}')
 
     print('-------')
