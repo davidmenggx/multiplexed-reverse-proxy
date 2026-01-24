@@ -6,7 +6,7 @@ from enum import Enum
 
 from cache import Cache
 from load_balancer import LoadBalancer
-from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response, get_cache_control
+from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response, get_cache_control, compress_response
 
 HEADER_DELIMITER = b'\r\n\r\n'
 
@@ -126,10 +126,10 @@ class ConnectionContext:
                     self.state = ProcessingStates.WRITE_CLIENT
                     return
                 
-                request_headers_lower = {key.lower(): value.lower() for key, value in request_headers.items()}
+                self.request_headers_lower = {key.lower(): value.lower() for key, value in request_headers.items()}
 
                 try:
-                    self.request_content_length: int = int(request_headers_lower.get('content-length', 0))
+                    self.request_content_length: int = int(self.request_headers_lower.get('content-length', 0))
                 except Exception as e:
                     print(f'Could not parse content length: {e}')
                     return
@@ -146,11 +146,11 @@ class ConnectionContext:
             request_headers['X-Forwarded-For'] = f'{self.client_addr[0].replace("'", '')}' # type: ignore
             request_headers['X-Forwarded-Proto'] = 'https'
 
-            if 'connection' in request_headers_lower:
-                self.keepalive = True if request_headers_lower.get('connection') != 'close' else False
+            if 'connection' in self.request_headers_lower:
+                self.keepalive = True if self.request_headers_lower.get('connection') != 'close' else False
                 _request_connection_key = next(k for k in request_headers if k.lower() == 'connection')
                 request_headers.pop(_request_connection_key)
-                request_headers_lower.pop('connection')
+                self.request_headers_lower.pop('connection')
 
             request_body = self.request_buffer[self.request_head_raw_length + len(HEADER_DELIMITER):]
             self.request_buffer = reconstruct_request(request_line, request_headers, request_body)
@@ -277,10 +277,20 @@ class ConnectionContext:
 
             # after the response has been loaded:
             # look up content length and make sure it has been loaded fully
-            self.response_body = b'' # FILL THIS IN DYNAMICALLY
-            # think about gzipping (look up accept-encoding)
+            if len(self.response_buffer) < self.response_head_raw_length + len(HEADER_DELIMITER) + self.response_content_length:
+                return
+            
             # if no compression, just return the response buffer, otherwise i will need to reconstruct it
-            self.response_buffer = reconstruct_response(self.response_line, self.response_headers, self.response_body)
+            response_body = self.response_buffer[self.response_head_raw_length + len(HEADER_DELIMITER):]
+
+            # think about gzipping (look up accept-encoding)
+            if 'accept-encoding' in self.request_headers_lower and 'content-encoding' not in self.response_headers_lower:
+                if 'gzip' in self.request_headers_lower['accept-encoding']:
+                    response_body = compress_response(response_body)
+                    self.response_headers['Content-Length'] = str(len(response_body))
+                    self.response_headers['Content-Encoding'] = 'gzip'
+
+            self.response_buffer = reconstruct_response(self.response_line, self.response_headers, response_body)
 
             if 'cache-control' in self.response_headers_lower:
                 if max_age := get_cache_control(self.response_headers_lower['cache-control']):

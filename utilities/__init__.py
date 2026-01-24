@@ -7,3 +7,5 @@ from .reconstruct_request import reconstruct_request
 from .reconstruct_response import reconstruct_response
 
 from .get_cache_control import get_cache_control
+
+from .compress_response import compress_response
