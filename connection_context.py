@@ -6,7 +6,7 @@ from enum import Enum
 
 from cache import Cache
 from load_balancer import LoadBalancer
-from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response
+from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response, get_cache_control
 
 HEADER_DELIMITER = b'\r\n\r\n'
 
@@ -118,8 +118,9 @@ class ConnectionContext:
 
                 # maybe do validation on the request version ? or not because right now i have no version
 
-                if message := ConnectionContext.CACHE.get_request(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
+                if message := ConnectionContext.CACHE.get_message(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
                     # maybe i need to do something like loading the message? what do i load to?
+                    print('cache hit')
                     self.response_buffer = message
                     self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
                     self.state = ProcessingStates.WRITE_CLIENT
@@ -278,9 +279,14 @@ class ConnectionContext:
             # look up content length and make sure it has been loaded fully
             self.response_body = b'' # FILL THIS IN DYNAMICALLY
             # think about gzipping (look up accept-encoding)
-            # think about caching (loop up cache-control)
             # if no compression, just return the response buffer, otherwise i will need to reconstruct it
             self.response_buffer = reconstruct_response(self.response_line, self.response_headers, self.response_body)
+
+            if 'cache-control' in self.response_headers_lower:
+                if max_age := get_cache_control(self.response_headers_lower['cache-control']):
+                    ConnectionContext.CACHE.add_message(self.method, self.path, self.response_buffer, max_age)
+                    print('added to cache')
+
             print(self.response_buffer)
 
     def _write_client(self):
