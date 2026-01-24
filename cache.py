@@ -5,11 +5,11 @@ class Cache:
         self.cache = {} # stores (method, path): (message, timeout)
     
     def get_message(self, method: str, path: str) -> bytes:
-        if (method, path) in self.cache: # MAKE SURE TO CHECK TIME OUT
+        if method.lower() != 'post' and (method, path) in self.cache: # MAKE SURE TO CHECK TIME OUT
             if time.time() < self.cache[(method, path)][1]:
                 return self.cache[(method, path)][0]
         return b''
     
     def add_message(self, method: str, path: str, message: bytes, max_age: float) -> None:
         self.cache[(method, path)] = (message, time.time() + max_age) # ADD MAX_AGE TO CURRENT TIME
-        print(self.cache)
+        # print(self.cache)

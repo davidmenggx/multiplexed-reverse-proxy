@@ -1,4 +1,5 @@
 import ssl
+import time
 import errno
 import socket
 import selectors
@@ -28,6 +29,7 @@ class ConnectionContext:
     MAX_RETRIES: int
     CACHE: Cache
     LOAD_BALANCER: LoadBalancer
+    TIMEOUT: int
 
     def __init__(self, selector: selectors.BaseSelector, 
                 sock: ssl.SSLSocket, 
@@ -51,6 +53,8 @@ class ConnectionContext:
         self.response_header_parsed = False
 
         self._retries = 1
+
+        self.last_active = time.time()
 
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
         match (self.state, mask):
@@ -81,10 +85,11 @@ class ConnectionContext:
         except ssl.SSLWantReadError:
             self.selector.modify(self.client_sock, selectors.EVENT_READ, self)
         except ssl.SSLWantWriteError:
-            self.selector.modify(self.client_sock, selectors.EVENT_WRITE, self)
+            self._set_write_client_state()
         except Exception as e:
             print(f'An unexpected exception occurred on TLS handshake: {e}')
         self.state = ProcessingStates.READ_REQUEST
+        self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
     
     def _read_request(self) -> None:
         """
@@ -99,6 +104,7 @@ class ConnectionContext:
             return
         
         if data:
+            self.last_active = time.time()
             self.request_buffer += data
         else: # no data = end of connection, so close
             self._close()
@@ -118,13 +124,12 @@ class ConnectionContext:
 
                 # maybe do validation on the request version ? or not because right now i have no version
 
-                if message := ConnectionContext.CACHE.get_message(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
-                    # maybe i need to do something like loading the message? what do i load to?
-                    print('cache hit')
-                    self.response_buffer = message
-                    self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
-                    self.state = ProcessingStates.WRITE_CLIENT
-                    return
+                # if message := ConnectionContext.CACHE.get_message(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
+                #     # maybe i need to do something like loading the message? what do i load to?
+                #     print('cache hit')
+                #     self.response_buffer = message
+                #     self._set_write_client_state()
+                #     return
                 
                 self.request_headers_lower = {key.lower(): value.lower() for key, value in request_headers.items()}
 
@@ -132,6 +137,19 @@ class ConnectionContext:
                     self.request_content_length: int = int(self.request_headers_lower.get('content-length', 0))
                 except Exception as e:
                     print(f'Could not parse content length: {e}')
+                    return
+                
+                if 'connection' in self.request_headers_lower:
+                    self.keepalive = True if self.request_headers_lower.get('connection') != 'close' else False
+                    _request_connection_key = next(k for k in request_headers if k.lower() == 'connection')
+                    request_headers.pop(_request_connection_key)
+                    self.request_headers_lower.pop('connection')
+                
+                if message := ConnectionContext.CACHE.get_message(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
+                    # maybe i need to do something like loading the message? what do i load to?
+                    print('cache hit')
+                    self.response_buffer = message
+                    self._set_write_client_state()
                     return
                 
                 self.request_header_parsed = True
@@ -146,11 +164,11 @@ class ConnectionContext:
             request_headers['X-Forwarded-For'] = f'{self.client_addr[0].replace("'", '')}' # type: ignore
             request_headers['X-Forwarded-Proto'] = 'https'
 
-            if 'connection' in self.request_headers_lower:
-                self.keepalive = True if self.request_headers_lower.get('connection') != 'close' else False
-                _request_connection_key = next(k for k in request_headers if k.lower() == 'connection')
-                request_headers.pop(_request_connection_key)
-                self.request_headers_lower.pop('connection')
+            # if 'connection' in self.request_headers_lower:
+            #     self.keepalive = True if self.request_headers_lower.get('connection') != 'close' else False
+            #     _request_connection_key = next(k for k in request_headers if k.lower() == 'connection')
+            #     request_headers.pop(_request_connection_key)
+            #     self.request_headers_lower.pop('connection')
 
             request_body = self.request_buffer[self.request_head_raw_length + len(HEADER_DELIMITER):]
             self.request_buffer = reconstruct_request(request_line, request_headers, request_body)
@@ -297,7 +315,15 @@ class ConnectionContext:
                     ConnectionContext.CACHE.add_message(self.method, self.path, self.response_buffer, max_age)
                     print('added to cache')
 
-            print(self.response_buffer)
+            # print(self.response_buffer)
+            self._set_write_client_state()
+    
+    def _set_write_client_state(self):
+        try:
+            self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
+        except (ValueError, KeyError):
+            self.selector.register(self.client_sock, selectors.EVENT_WRITE, data=self)
+        self.state = ProcessingStates.WRITE_CLIENT
 
     def _write_client(self):
         """
@@ -315,8 +341,22 @@ class ConnectionContext:
                 pass
         
         if self.client_sock and not self.response_buffer:
-            self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self) # if everything is sent, change back to EVENT_READ to avoid excessively pinging
-            self.state = ProcessingStates.CLEANUP
+            if self.keepalive:
+                self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
+                self.state = ProcessingStates.READ_REQUEST
+                self.request_buffer: bytes = b''
+                self.response_buffer: bytes = b''
+
+                self.request_content_length = 0 # implement max buffer size to prevent malicious attacks?
+                self.response_content_length = 0
+
+                self.request_header_parsed = False
+                self.response_header_parsed = False
+
+                self._retries = 1
+            else:
+                self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self) # if everything is sent, change back to EVENT_READ to avoid excessively pinging
+                self.state = ProcessingStates.CLEANUP
 
     def _init_backend_conn(self):
         """
@@ -338,6 +378,7 @@ class ConnectionContext:
             print('CRITICAL: Failed to find backend server')
             return
         ConnectionContext.LOAD_BALANCER._increment_connection(self.backend_addr)
+        print(ConnectionContext.LOAD_BALANCER.servers_dict)
         if not self.backend_addr:
             ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
         
@@ -373,5 +414,6 @@ class ConnectionContext:
                 self.backend_sock.close()
             if self.backend_addr:
                 ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr)
+                self.backend_addr = None
         except Exception as e:
             print(f'error during close: {e}')

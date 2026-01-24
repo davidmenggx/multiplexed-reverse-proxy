@@ -88,6 +88,7 @@ class LoadBalancer:
             self.servers_dict[server] -= 1
             if self.servers_dict[server] < 0:
                 self.servers_dict[server] = 0
+                print(self.servers_dict)
                 print(f'FATAL: server {server} reached negative connections')
         except KeyError:
             print('FATAL: Server specified does not exist')

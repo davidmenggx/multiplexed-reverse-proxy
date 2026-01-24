@@ -1,4 +1,5 @@
 import ssl
+import time
 import socket
 import signal
 import argparse
@@ -15,6 +16,7 @@ parser.add_argument('-l', '--loadalg', type=str, default='LEAST_CONNECTIONS', he
 parser.add_argument('-d', '--discovery', type=int, default=49152, help='Port for server to run on')
 parser.add_argument('-t', '--threshold', type=int, default=3, help='Max number of failed connections before server is removed from load balancer')
 parser.add_argument('-r', '--retries', type=int, default=5, help='Max number of connection retries until error')
+parser.add_argument('-k', '--keepalive', type=int, default=3, help='Duration in seconds before keep-alive connections are timed-out')
 
 args = parser.parse_args()
 
@@ -32,6 +34,7 @@ ConnectionContext.FAILURE_THRESHOLD = args.threshold
 ConnectionContext.MAX_RETRIES = args.retries
 ConnectionContext.CACHE = Cache()
 ConnectionContext.LOAD_BALANCER = LoadBalancer(algorithm=LOAD_BALANCING_ALGORITHM)
+ConnectionContext.TIMEOUT = args.keepalive
 
 RUNNING = True
 
@@ -110,6 +113,14 @@ def main() -> None:
                 accept_connection(key.fileobj)
             else: # otherwise it is a socket that is ready to be processed
                 key.data.process_events(mask)
+        current_time = time.time()
+        for map_key in list(sel.get_map().values()):
+            context = map_key.data
+            if context is None:
+                continue
+            if current_time - context.last_active > ConnectionContext.TIMEOUT:
+                print(f"Connection from {context.client_addr} timed out.")
+                context._close()
     sel.close()
 
 if __name__ == '__main__':
