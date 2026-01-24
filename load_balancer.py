@@ -73,8 +73,10 @@ class LoadBalancer:
         return ip_hash_server
     
     def _add_server(self, server: tuple[str, int]) -> None: # there need to parms here too
-        self.servers_dict[server] = 0
-        self.servers_list = list(self.servers_dict.keys())
+        if server not in self.servers_dict:
+            self.servers_dict[server] = 0
+            print(f'Added server: {server}')
+            self.servers_list = list(self.servers_dict.keys())
     
     def _remove_server(self, server: tuple[str, int]) -> None:
         try:

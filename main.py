@@ -3,6 +3,7 @@ import socket
 import signal
 import argparse
 import selectors
+import threading
 
 from load_balancer import LoadBalancer
 from connection_context import ConnectionContext
@@ -10,11 +11,14 @@ from connection_context import ConnectionContext
 parser = argparse.ArgumentParser(description="Configs for multiplexed reverse proxy")
 parser.add_argument('-p', '--port', type=int, default=8443, help='Port for server to run on')
 parser.add_argument('-l', '--loadalg', type=str, default='LEAST_CONNECTIONS', help='Choose a load balancing algorithm. Valid options: "LEAST_CONNECTIONS" (default), "IP_HASH", "RANDOM", "ROUND_ROBIN"')
+parser.add_argument('-d', '--discovery', type=int, default=49152, help='Port for server to run on')
 
 args = parser.parse_args()
 
 HOST = ''
 PORT = args.port
+
+DISCOVERY_PORT = args.discovery if args.discovery != PORT else 49153
 
 LOAD_BALANCING_ALGORITHM = args.loadalg.upper() 
 if LOAD_BALANCING_ALGORITHM not in {'IP_HASH', 'LEAST_CONNECTIONS', 'RANDOM', 'ROUND_ROBIN'}:
@@ -63,6 +67,30 @@ def accept_connection(sock) -> None:
     
     print(f'Accepted and registered connection from {addr}')
 
+def discover_servers() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as discovery_sock:
+        discovery_sock.bind((HOST, DISCOVERY_PORT))
+        discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        discovery_sock.listen() 
+
+        buffer = ""
+        while True:
+            conn, addr = discovery_sock.accept() # make sure that i don't need to socket itself, just the information
+            # addr is in the form ('IP', PORT, _, _)
+            with conn:
+                data = conn.recv(1024)
+                buffer += data.decode('utf-8')
+
+                while '\r\n' in buffer:
+                    message, buffer = buffer.split('\r\n', 1)
+                    if message:
+                        try:
+                            ip, port = message.split(',')
+                            LOAD_BALANCER._add_server((ip, int(port)))
+                            print(f'Found server ({ip}, {port})')
+                        except ValueError:
+                            print(f"Malformed message received: {message}")
+
 def main() -> None:
     while RUNNING:
         events = sel.select(timeout=1)
@@ -76,6 +104,10 @@ def main() -> None:
     sel.close()
 
 if __name__ == '__main__':
+    print(f'Starting heartbeat thread listening to port {DISCOVERY_PORT}')
+    heartbeat_thread = threading.Thread(target=discover_servers, daemon=True)
+    heartbeat_thread.start()
+
     print(f'Starting reverse proxy server listening to port {PORT}')
 
     main()
