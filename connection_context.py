@@ -1,4 +1,5 @@
 import ssl
+import errno
 import socket
 import selectors
 from enum import Enum
@@ -10,6 +11,8 @@ from utilities import parse_request, reconstruct_request, parse_response, recons
 CACHE = Cache()
 
 HEADER_DELIMITER = b'\r\n\r\n'
+
+FAILED_SERVERS = {}
 
 class ProcessingStates(Enum):
     TLS_HANDSHAKE = 'TLS_HANDSHAKE'
@@ -47,6 +50,11 @@ class ConnectionContext:
 
         self.LOAD_BALANCER = LoadBalancer()
 
+        self.MAX_RETRIES = 10
+        self._retries = 1
+
+        self.FAILURE_THRESHOLD = 1
+
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
         match (self.state, mask):
             case (ProcessingStates.TLS_HANDSHAKE, m) if m & (selectors.EVENT_READ | selectors.EVENT_WRITE):
@@ -55,7 +63,7 @@ class ConnectionContext:
                 self._read_request()
 
             case (ProcessingStates.CONNECT_BACKEND, m) if m & selectors.EVENT_WRITE:
-                self._finish_connection()
+                self._confirm_backend_conn()
 
             case (ProcessingStates.WRITE_BACKEND, m) if m & selectors.EVENT_WRITE:
                 self._write_request()
@@ -159,20 +167,57 @@ class ConnectionContext:
 
             print(self.request_buffer)
     
-    def _finish_connection(self) -> None:
+    def _confirm_backend_conn(self) -> None:
         """
         Called when backend_sock becomes writable (connection established)
         checks SO_ERROR
         if valid => update selector to write request -> state to WRITE_BACKEND
         """
         print('finishing connection')
-        if self.backend_sock and not (error := self.backend_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)):
+        if self.backend_sock and not (error_code := self.backend_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)):
             # if you reach this point, it means you have finished the connection to the backend
             self.state = ProcessingStates.WRITE_BACKEND
-        else:
-            print(f'CRITICAL: Error occured when connecting to backend: {error}')
-            # at this point, either retry a new connection or buffer 502 bad gateway + set state to write client
+        elif self._retries < self.MAX_RETRIES:
+            print(f'CRITICAL: Error occured when connecting to backend: {errno.errorcode.get(error_code)}') # errno for more descriptive error messages
+            
+            FAILED_SERVERS[self.backend_addr] = FAILED_SERVERS.get(self.backend_addr, 0) + 1
+
+            if FAILED_SERVERS[self.backend_addr] > self.FAILURE_THRESHOLD and self.backend_addr:
+                try:
+                    print(f'CRITICAL: Failure threshold {self.FAILURE_THRESHOLD} hit on server {self.backend_addr}, removing')
+                    self.LOAD_BALANCER._remove_server(self.backend_addr)
+                    del FAILED_SERVERS[self.backend_addr]
+                # except ZeroDivisionError:
+                #     print('No active servers remaining!')
+                #     return # CRITICAL: THIS MEANS NO MORE SERVERS LEFT, PERHAPS SERVICE UNAVAILABLE?
+                except KeyError:
+                    ...
+
+            print(FAILED_SERVERS)
+            if self.backend_sock:
+                try:
+                    self.selector.unregister(self.backend_sock)
+                    self.backend_sock.close()
+                except (KeyError, OSError):
+                    pass
+                self.backend_sock = None
+            if self.backend_addr:
+                self.backend_addr = None
+            
+            print(f'Trying again with new backend. Attempt {self._retries}/{self.MAX_RETRIES}')
+            self._retries += 1
+            self._init_backend_conn()
             return
+        else:
+            print('502 bad gateway')
+            try:
+                self.selector.register(self.client_sock, selectors.EVENT_WRITE, data=self)
+                # load up the 502 bad gateway buffer and send to client
+                self.state = ProcessingStates.WRITE_CLIENT
+            except KeyError:
+                pass
+            return
+            # at this point return bad gateway
     
     def _write_request(self) -> None:
         """
@@ -273,6 +318,9 @@ class ConnectionContext:
         try:
             self.backend_addr = self.LOAD_BALANCER.get_server(self.client_addr[0]) # type: ignore
             print(f'Got server: {self.backend_addr}')
+        except ZeroDivisionError:
+            print('CRITICAL: No active servers remaining!')
+            return
         except ValueError:
             print('CRITICAL: Failed to find backend server')
             return
@@ -286,22 +334,29 @@ class ConnectionContext:
         self.backend_sock.connect_ex(self.backend_addr)
 
         self.selector.register(self.backend_sock, selectors.EVENT_WRITE, data=self)
-        self.selector.unregister(self.client_sock)
+        try:
+            self.selector.unregister(self.client_sock)
+        except KeyError:
+            pass
 
     def _close(self) -> None:
         print('closing down connection')
         try:
             if self.client_sock:
                 try:
+                    print('unregistering client socket')
                     self.selector.unregister(self.client_sock)
-                except KeyError: 
+                except (KeyError, ValueError): 
                     pass
+                print('closing client socket')
                 self.client_sock.close()
             if self.backend_sock:
                 try:
+                    print('unregistering backend socket')
                     self.selector.unregister(self.backend_sock)
-                except KeyError: 
+                except (KeyError, ValueError): 
                     pass
+                print('closing backend socket')
                 self.backend_sock.close()
             if self.backend_addr:
                 self.LOAD_BALANCER._decrement_connection(self.backend_addr)
