@@ -8,11 +8,7 @@ from cache import Cache
 from load_balancer import LoadBalancer
 from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response
 
-CACHE = Cache()
-
 HEADER_DELIMITER = b'\r\n\r\n'
-
-FAILED_SERVERS = {}
 
 class ProcessingStates(Enum):
     TLS_HANDSHAKE = 'TLS_HANDSHAKE'
@@ -27,6 +23,12 @@ class ProcessingStates(Enum):
 # THEN RESET ALL OF THE BUFFERS, BUT DO NOT RESET THE SOCKETS
 
 class ConnectionContext:
+    FAILED_SERVERS = {}
+    FAILURE_THRESHOLD: int
+    MAX_RETRIES: int
+    CACHE: Cache
+    LOAD_BALANCER: LoadBalancer
+
     def __init__(self, selector: selectors.BaseSelector, 
                 sock: ssl.SSLSocket, 
                 addr: socket.AddressFamily) -> None:
@@ -48,12 +50,7 @@ class ConnectionContext:
         self.request_header_parsed = False
         self.response_header_parsed = False
 
-        self.LOAD_BALANCER = LoadBalancer()
-
-        self.MAX_RETRIES = 10
         self._retries = 1
-
-        self.FAILURE_THRESHOLD = 1
 
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
         match (self.state, mask):
@@ -121,7 +118,7 @@ class ConnectionContext:
 
                 # maybe do validation on the request version ? or not because right now i have no version
 
-                if message := CACHE.get_request(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
+                if message := ConnectionContext.CACHE.get_request(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
                     # maybe i need to do something like loading the message? what do i load to?
                     self.response_buffer = message
                     self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
@@ -177,23 +174,23 @@ class ConnectionContext:
         if self.backend_sock and not (error_code := self.backend_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)):
             # if you reach this point, it means you have finished the connection to the backend
             self.state = ProcessingStates.WRITE_BACKEND
-        elif self._retries < self.MAX_RETRIES:
+        elif self._retries < ConnectionContext.MAX_RETRIES:
             print(f'CRITICAL: Error occured when connecting to backend: {errno.errorcode.get(error_code)}') # errno for more descriptive error messages
             
-            FAILED_SERVERS[self.backend_addr] = FAILED_SERVERS.get(self.backend_addr, 0) + 1
+            ConnectionContext.FAILED_SERVERS[self.backend_addr] = ConnectionContext.FAILED_SERVERS.get(self.backend_addr, 0) + 1
 
-            if FAILED_SERVERS[self.backend_addr] > self.FAILURE_THRESHOLD and self.backend_addr:
+            if ConnectionContext.FAILED_SERVERS[self.backend_addr] > ConnectionContext.FAILURE_THRESHOLD and self.backend_addr:
                 try:
-                    print(f'CRITICAL: Failure threshold {self.FAILURE_THRESHOLD} hit on server {self.backend_addr}, removing')
-                    self.LOAD_BALANCER._remove_server(self.backend_addr)
-                    del FAILED_SERVERS[self.backend_addr]
+                    print(f'CRITICAL: Failure threshold {ConnectionContext.FAILURE_THRESHOLD} hit on server {self.backend_addr}, removing')
+                    ConnectionContext.LOAD_BALANCER._remove_server(self.backend_addr)
+                    del ConnectionContext.FAILED_SERVERS[self.backend_addr]
                 # except ZeroDivisionError:
                 #     print('No active servers remaining!')
                 #     return # CRITICAL: THIS MEANS NO MORE SERVERS LEFT, PERHAPS SERVICE UNAVAILABLE?
                 except KeyError:
                     ...
 
-            print(FAILED_SERVERS)
+            print(ConnectionContext.FAILED_SERVERS)
             if self.backend_sock:
                 try:
                     self.selector.unregister(self.backend_sock)
@@ -204,7 +201,7 @@ class ConnectionContext:
             if self.backend_addr:
                 self.backend_addr = None
             
-            print(f'Trying again with new backend. Attempt {self._retries}/{self.MAX_RETRIES}')
+            print(f'Trying again with new backend. Attempt {self._retries}/{ConnectionContext.MAX_RETRIES}')
             self._retries += 1
             self._init_backend_conn()
             return
@@ -316,7 +313,7 @@ class ConnectionContext:
         print('initializing backend connection')
         # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
         try:
-            self.backend_addr = self.LOAD_BALANCER.get_server(self.client_addr[0]) # type: ignore
+            self.backend_addr = ConnectionContext.LOAD_BALANCER.get_server(self.client_addr[0]) # type: ignore
             print(f'Got server: {self.backend_addr}')
         except ZeroDivisionError:
             print('CRITICAL: No active servers remaining!')
@@ -324,7 +321,7 @@ class ConnectionContext:
         except ValueError:
             print('CRITICAL: Failed to find backend server')
             return
-        self.LOAD_BALANCER._increment_connection(self.backend_addr)
+        ConnectionContext.LOAD_BALANCER._increment_connection(self.backend_addr)
         if not self.backend_addr:
             ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
         
@@ -359,6 +356,6 @@ class ConnectionContext:
                 print('closing backend socket')
                 self.backend_sock.close()
             if self.backend_addr:
-                self.LOAD_BALANCER._decrement_connection(self.backend_addr)
+                ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr)
         except Exception as e:
             print(f'error during close: {e}')

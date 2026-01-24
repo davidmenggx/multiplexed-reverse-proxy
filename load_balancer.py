@@ -5,18 +5,7 @@ import hashlib
 SERVERS_FILEPATH = 'servers.json'
 
 class LoadBalancer:
-    _instance = None
-    _initialized = False
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super(LoadBalancer, cls).__new__(cls)
-        return cls._instance
-
-    def __init__(self, algorithm: str | None = None) -> None:
-        if self._initialized:
-            return
-        
+    def __init__(self, algorithm: str | None = None) -> None:        
         self.algorithm = algorithm or 'LEAST_CONNECTIONS'
 
         try:
@@ -30,7 +19,6 @@ class LoadBalancer:
 
             self.ROUND_ROBIN_COUNTER = 0
             
-            self.__class__._initialized = True
             print(self.servers_list)
         except KeyError as e:
             print(f'Error: Missing expected key in JSON: {e}')

@@ -5,6 +5,7 @@ import argparse
 import selectors
 import threading
 
+from cache import Cache
 from load_balancer import LoadBalancer
 from connection_context import ConnectionContext
 
@@ -12,6 +13,8 @@ parser = argparse.ArgumentParser(description="Configs for multiplexed reverse pr
 parser.add_argument('-p', '--port', type=int, default=8443, help='Port for server to run on')
 parser.add_argument('-l', '--loadalg', type=str, default='LEAST_CONNECTIONS', help='Choose a load balancing algorithm. Valid options: "LEAST_CONNECTIONS" (default), "IP_HASH", "RANDOM", "ROUND_ROBIN"')
 parser.add_argument('-d', '--discovery', type=int, default=49152, help='Port for server to run on')
+parser.add_argument('-t', '--threshold', type=int, default=3, help='Max number of failed connections before server is removed from load balancer')
+parser.add_argument('-r', '--retries', type=int, default=5, help='Max number of connection retries until error')
 
 args = parser.parse_args()
 
@@ -25,7 +28,10 @@ if LOAD_BALANCING_ALGORITHM not in {'IP_HASH', 'LEAST_CONNECTIONS', 'RANDOM', 'R
     print(f'Error: specified load balancing algorithm {args.loadalg} does not exist, defaulting to least connections')
     LOAD_BALANCING_ALGORITHM = 'LEAST_CONNECTIONS'
 
-LOAD_BALANCER = LoadBalancer(algorithm=LOAD_BALANCING_ALGORITHM)
+ConnectionContext.FAILURE_THRESHOLD = args.threshold
+ConnectionContext.MAX_RETRIES = args.retries
+ConnectionContext.CACHE = Cache()
+ConnectionContext.LOAD_BALANCER = LoadBalancer(algorithm=LOAD_BALANCING_ALGORITHM)
 
 RUNNING = True
 
@@ -86,8 +92,11 @@ def discover_servers() -> None:
                     if message:
                         try:
                             ip, port = message.split(',')
-                            LOAD_BALANCER._add_server((ip, int(port)))
-                            print(f'Found server ({ip}, {port})')
+                            if ConnectionContext.LOAD_BALANCER:
+                                ConnectionContext.LOAD_BALANCER._add_server((ip, int(port)))
+                                print(f'Found server ({ip}, {port})')
+                            else:
+                                print('Could not find load balancer!')
                         except ValueError:
                             print(f"Malformed message received: {message}")
 
