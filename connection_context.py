@@ -20,9 +20,6 @@ class ProcessingStates(Enum):
     WRITE_CLIENT = 'WRITE_CLIENT'
     CLEANUP = 'CLEANUP'
 
-# FOR KEEPALIVE, MAKE IT SO THAT INSTEAD OF GOING FROM WRITE_CLIENT => CLEANUP, MAKE IT LOOP BACK TO READ_REQUEST
-# THEN RESET ALL OF THE BUFFERS, BUT DO NOT RESET THE SOCKETS
-
 class ConnectionContext:
     FAILED_SERVERS = {}
     FAILURE_THRESHOLD: int
@@ -33,16 +30,20 @@ class ConnectionContext:
 
     def __init__(self, selector: selectors.BaseSelector, 
                 sock: ssl.SSLSocket, 
-                addr: socket.AddressFamily) -> None:
-        self.selector: selectors.BaseSelector = selector
+                addr: tuple) -> None:
+        self.selector = selector
 
-        self.client_sock: ssl.SSLSocket = sock
-        self.client_addr: socket.AddressFamily = addr
+        self.client_sock = sock
+        self.client_addr = addr
 
-        self.backend_sock: socket.socket | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
-        self.backend_addr: tuple[str, int] | None = None  # THIS IS CREATED WHEN A BACKEND CONNECTION IS MADE
+        self.backend_sock: socket.socket | None = None
+        self.backend_addr: tuple[str, int] | None = None
 
         self.state = ProcessingStates.TLS_HANDSHAKE
+        self._init_connection_info()
+        self.last_active = time.time()
+    
+    def _init_connection_info(self) -> None:
         self.request_buffer: bytes = b''
         self.response_buffer: bytes = b''
 
@@ -52,11 +53,11 @@ class ConnectionContext:
         self.request_header_parsed = False
         self.response_header_parsed = False
 
-        self._retries = 1
-
-        self.last_active = time.time()
+        self._retries = 0
 
     def process_events(self, mask: int) -> None: # "blind" method that does whatever based on the state of the socket
+        self.last_active = time.time()
+
         match (self.state, mask):
             case (ProcessingStates.TLS_HANDSHAKE, m) if m & (selectors.EVENT_READ | selectors.EVENT_WRITE):
                 self._handshake()
@@ -84,10 +85,15 @@ class ConnectionContext:
             self.client_sock.do_handshake()
         except ssl.SSLWantReadError:
             self.selector.modify(self.client_sock, selectors.EVENT_READ, self)
+            return
         except ssl.SSLWantWriteError:
-            self._set_write_client_state()
+            self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
+            return
         except Exception as e:
             print(f'An unexpected exception occurred on TLS handshake: {e}')
+            self._close()
+            return
+        
         self.state = ProcessingStates.READ_REQUEST
         self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
     
@@ -102,9 +108,11 @@ class ConnectionContext:
             data: bytes = self.client_sock.recv(4096)
         except (BlockingIOError, ssl.SSLWantReadError): # if for some reason no data is found, do nothing
             return
+        except Exception:
+            self._close()
+            return
         
         if data:
-            self.last_active = time.time()
             self.request_buffer += data
         else: # no data = end of connection, so close
             self._close()
@@ -112,24 +120,20 @@ class ConnectionContext:
         
         if HEADER_DELIMITER in self.request_buffer:
             if not self.request_header_parsed:
-                request_head_raw, _, request_remaining_bytes = self.request_buffer.partition(HEADER_DELIMITER)
+                request_head_raw, _, _ = self.request_buffer.partition(HEADER_DELIMITER)
                 self.request_head_raw_length = len(request_head_raw)
 
                 try:
                     request_line, request_headers = parse_request(request_head_raw) # this will be in the original casing
                 except ValueError:
+                    print('malformed request, sending back 400')
+                    self.response_buffer = b'400 bad request'
+                    self._set_write_client_state()
                     return # CRITICAL: COULD NOT PARSE ERROR 400 BAD REQUEST
                 
                 self.method, self.path = request_line.split()[:2]
 
                 # maybe do validation on the request version ? or not because right now i have no version
-
-                # if message := ConnectionContext.CACHE.get_message(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
-                #     # maybe i need to do something like loading the message? what do i load to?
-                #     print('cache hit')
-                #     self.response_buffer = message
-                #     self._set_write_client_state()
-                #     return
                 
                 self.request_headers_lower = {key.lower(): value.lower() for key, value in request_headers.items()}
 
@@ -164,12 +168,6 @@ class ConnectionContext:
             request_headers['X-Forwarded-For'] = f'{self.client_addr[0].replace("'", '')}' # type: ignore
             request_headers['X-Forwarded-Proto'] = 'https'
 
-            # if 'connection' in self.request_headers_lower:
-            #     self.keepalive = True if self.request_headers_lower.get('connection') != 'close' else False
-            #     _request_connection_key = next(k for k in request_headers if k.lower() == 'connection')
-            #     request_headers.pop(_request_connection_key)
-            #     self.request_headers_lower.pop('connection')
-
             request_body = self.request_buffer[self.request_head_raw_length + len(HEADER_DELIMITER):]
             self.request_buffer = reconstruct_request(request_line, request_headers, request_body)
             
@@ -203,11 +201,8 @@ class ConnectionContext:
                     print(f'CRITICAL: Failure threshold {ConnectionContext.FAILURE_THRESHOLD} hit on server {self.backend_addr}, removing')
                     ConnectionContext.LOAD_BALANCER._remove_server(self.backend_addr)
                     del ConnectionContext.FAILED_SERVERS[self.backend_addr]
-                # except ZeroDivisionError:
-                #     print('No active servers remaining!')
-                #     return # CRITICAL: THIS MEANS NO MORE SERVERS LEFT, PERHAPS SERVICE UNAVAILABLE?
                 except KeyError:
-                    ...
+                    pass
 
             print(ConnectionContext.FAILED_SERVERS)
             if self.backend_sock:
@@ -226,12 +221,8 @@ class ConnectionContext:
             return
         else:
             print('502 bad gateway')
-            try:
-                self.selector.register(self.client_sock, selectors.EVENT_WRITE, data=self)
-                # load up the 502 bad gateway buffer and send to client
-                self.state = ProcessingStates.WRITE_CLIENT
-            except KeyError:
-                pass
+            self.response_buffer = b'502 bad gateway'
+            self._set_write_client_state()
             return
             # at this point return bad gateway
     
@@ -341,22 +332,19 @@ class ConnectionContext:
                 pass
         
         if self.client_sock and not self.response_buffer:
-            if self.keepalive:
-                self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
-                self.state = ProcessingStates.READ_REQUEST
-                self.request_buffer: bytes = b''
-                self.response_buffer: bytes = b''
+            try:
+                if self.keepalive:
+                    self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
 
-                self.request_content_length = 0 # implement max buffer size to prevent malicious attacks?
-                self.response_content_length = 0
-
-                self.request_header_parsed = False
-                self.response_header_parsed = False
-
-                self._retries = 1
-            else:
-                self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self) # if everything is sent, change back to EVENT_READ to avoid excessively pinging
-                self.state = ProcessingStates.CLEANUP
+                    self.state = ProcessingStates.READ_REQUEST
+                    self._init_connection_info()
+                    print('keepalive, going back to read request')
+                    return
+            except AttributeError:
+                pass
+            print('no keepalive')
+            self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
+            self.state = ProcessingStates.CLEANUP
 
     def _init_backend_conn(self):
         """
@@ -371,11 +359,10 @@ class ConnectionContext:
         try:
             self.backend_addr = ConnectionContext.LOAD_BALANCER.get_server(self.client_addr[0]) # type: ignore
             print(f'Got server: {self.backend_addr}')
-        except ZeroDivisionError:
-            print('CRITICAL: No active servers remaining!')
-            return
-        except ValueError:
+        except (ValueError, ZeroDivisionError):
             print('CRITICAL: Failed to find backend server')
+            self.response_buffer = b'503 service unavailable'
+            self._set_write_client_state()
             return
         ConnectionContext.LOAD_BALANCER._increment_connection(self.backend_addr)
         print(ConnectionContext.LOAD_BALANCER.servers_dict)
@@ -417,3 +404,4 @@ class ConnectionContext:
                 self.backend_addr = None
         except Exception as e:
             print(f'error during close: {e}')
+        print('everything closed')

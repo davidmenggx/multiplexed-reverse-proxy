@@ -5,55 +5,84 @@ import signal
 import argparse
 import selectors
 import threading
+from ssl import SSLContext, PROTOCOL_TLS_SERVER
 
 from cache import Cache
 from load_balancer import LoadBalancer
 from connection_context import ConnectionContext
 
+# Parse command line arguments
 parser = argparse.ArgumentParser(description="Configs for multiplexed reverse proxy")
 parser.add_argument('-p', '--port', type=int, default=8443, help='Port for server to run on')
-parser.add_argument('-l', '--loadalg', type=str, default='LEAST_CONNECTIONS', help='Choose a load balancing algorithm. Valid options: "LEAST_CONNECTIONS" (default), "IP_HASH", "RANDOM", "ROUND_ROBIN"')
-parser.add_argument('-d', '--discovery', type=int, default=49152, help='Port for server to run on')
+parser.add_argument('-l', '--loadbal', type=str, default='LEAST_CONNECTIONS', help='Choose a load balancing algorithm. Valid options: "LEAST_CONNECTIONS" (default), "IP_HASH", "RANDOM", "ROUND_ROBIN"')
+parser.add_argument('-d', '--discovery', type=int, default=49152, help='Port for server discovery')
 parser.add_argument('-t', '--threshold', type=int, default=3, help='Max number of failed connections before server is removed from load balancer')
 parser.add_argument('-r', '--retries', type=int, default=5, help='Max number of connection retries until error')
 parser.add_argument('-k', '--keepalive', type=int, default=3, help='Duration in seconds before keep-alive connections are timed-out')
 
 args = parser.parse_args()
 
+# Validate command line arguments:
+if not (0 <= args.port <= 65535):
+    raise ValueError(f'FATAL: specified port {args.port} does not exist!')
+
+if not (0 <= args.discovery <= 65535):
+    raise ValueError(f'FATAL: specified discovery port {args.discovery} does not exist!')
+
+if args.port == args.discovery:
+    raise ValueError(f'FATAL: Server and discovery port cannot be the same! Currently both {args.port}')
+
+if args.threshold <= 0:
+    raise ValueError(f'FATAL: Server failure threshold must be positive! Currently {args.threshold}')
+
+if args.retries < 0:
+    raise ValueError(f'FATAL: Maximum retries cannot be negative! Currently {args.retries}')
+
+if args.keepalive < 0:
+    raise ValueError(f'FATAL: Keep-alive time cannot be negative! Currently {args.keepalive}')
+
 HOST = ''
 PORT = args.port
 
-DISCOVERY_PORT = args.discovery if args.discovery != PORT else 49153
+DISCOVERY_PORT = args.discovery
 
-LOAD_BALANCING_ALGORITHM = args.loadalg.upper() 
+LOAD_BALANCING_ALGORITHM = args.loadbal.upper() 
 if LOAD_BALANCING_ALGORITHM not in {'IP_HASH', 'LEAST_CONNECTIONS', 'RANDOM', 'ROUND_ROBIN'}:
-    print(f'Error: specified load balancing algorithm {args.loadalg} does not exist, defaulting to least connections')
+    print(f'Error: specified load balancing algorithm {args.loadbal} does not exist, defaulting to least connections!')
     LOAD_BALANCING_ALGORITHM = 'LEAST_CONNECTIONS'
 
+# Initialize ConnectionContext with command line arguments
 ConnectionContext.FAILURE_THRESHOLD = args.threshold
 ConnectionContext.MAX_RETRIES = args.retries
 ConnectionContext.CACHE = Cache()
 ConnectionContext.LOAD_BALANCER = LoadBalancer(algorithm=LOAD_BALANCING_ALGORITHM)
 ConnectionContext.TIMEOUT = args.keepalive
 
+# Shut the server down
 RUNNING = True
-
 def signal_shutdown(_sig, _frame) -> None:
     """Shut down server"""
     global RUNNING
     RUNNING = False
-
 signal.signal(signal.SIGINT, signal_shutdown) # Catch CTRL+C
 signal.signal(signal.SIGTERM, signal_shutdown) # Catch kill command
 
+# TLS Protocol
+context = SSLContext(PROTOCOL_TLS_SERVER)
+context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
+context.verify_mode = ssl.CERT_NONE
+
+# Server Connections
 sel = selectors.DefaultSelector()
 
 lsock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
 
 lsock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
 lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-lsock.bind((HOST, PORT))
+try:
+    lsock.bind((HOST, PORT))
+except OSError as e:
+    raise RuntimeError(f"Failed to bind to port {PORT}: {e}")
 
 lsock.listen()
 
@@ -61,10 +90,8 @@ lsock.setblocking(False)
 
 sel.register(lsock, selectors.EVENT_READ, data=None)
 
-context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH) # use CLIENT_AUTH since i am in the role of the server itself
-context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
-
 def accept_connection(sock) -> None:
+    """Accepts client requests, initializes new ConnectionContext, and registers to selector"""
     conn, addr = sock.accept()
     
     ssl_conn = context.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
@@ -77,37 +104,66 @@ def accept_connection(sock) -> None:
     print(f'Accepted and registered connection from {addr}')
 
 def discover_servers() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as discovery_sock:
-        discovery_sock.bind((HOST, DISCOVERY_PORT))
-        discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        discovery_sock.listen() 
+    """
+    Discovery thread for server discovery
+    Receives HOST,PORT tuples from servers
+    Adds server information to load balancer for future connections
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as discovery_sock:
+            discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                discovery_sock.bind((HOST, DISCOVERY_PORT))
+                discovery_sock.listen() 
+                print(f'Discovery thread listening to port {DISCOVERY_PORT}')
+            except OSError as e:
+                print(f"CRITICAL: Discovery thread failed to bind port {DISCOVERY_PORT}: {e}")
+                return
 
-        buffer = ""
-        while True:
-            conn, addr = discovery_sock.accept() # make sure that i don't need to socket itself, just the information
-            # addr is in the form ('IP', PORT, _, _)
-            with conn:
-                data = conn.recv(1024)
-                buffer += data.decode('utf-8')
+            buffer = ""
+            while RUNNING:
+                discovery_sock.settimeout(1.0)
+                try:
+                    conn, _ = discovery_sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
 
-                while '\r\n' in buffer:
-                    message, buffer = buffer.split('\r\n', 1)
-                    if message:
-                        try:
-                            ip, port = message.split(',')
-                            if ConnectionContext.LOAD_BALANCER:
-                                ConnectionContext.LOAD_BALANCER._add_server((ip, int(port)))
-                                print(f'Found server ({ip}, {port})')
-                            else:
-                                print('Could not find load balancer!')
-                        except ValueError:
-                            print(f"Malformed message received: {message}")
+                with conn:
+                    conn.settimeout(2.0) # make sure one server doesn't hang
+                    try:
+                            data = conn.recv(1024)
+                            if not data:
+                                continue
+                            buffer += data.decode('utf-8')
+
+                            while '\r\n' in buffer:
+                                message, buffer = buffer.split('\r\n', 1)
+                                if message:
+                                    try:
+                                        ip, port = message.split(',')
+                                        if ConnectionContext.LOAD_BALANCER:
+                                            ConnectionContext.LOAD_BALANCER._add_server((ip, int(port)))
+                                            print(f'Registered server: {ip}:{port}')
+                                    except ValueError:
+                                        print(f"Ignored malformed discovery msg: {message}")
+                    except socket.timeout:
+                        print("Warning: Discovery connection timed out")
+                    except Exception as e:
+                        print(f"Discovery error: {e}")
+    except Exception as e:
+        print(f"CRITICAL: Discovery thread crashed: {e}")
 
 def main() -> None:
+    """
+    Manages ready to read sockets depending on state
+    If listener socket, registers the new request connection
+    If client socket, calls the appropriate method using dispatcher process_events
+    Removes persistent connections if keep-alive time expires
+    """
     while RUNNING:
-        events = sel.select(timeout=1)
-        if not events:
-            continue
+        events = sel.select(timeout=1.0)
         for key, mask in events:
             if key.data is None: # the listener has data=None, so when key.data is None, it is a new connection incoming
                 accept_connection(key.fileobj)
@@ -122,11 +178,11 @@ def main() -> None:
                 print(f"Connection from {context.client_addr} timed out.")
                 context._close()
     sel.close()
+    lsock.close()
 
 if __name__ == '__main__':
-    print(f'Starting heartbeat thread listening to port {DISCOVERY_PORT}')
-    heartbeat_thread = threading.Thread(target=discover_servers, daemon=True)
-    heartbeat_thread.start()
+    discovery_thrad = threading.Thread(target=discover_servers, daemon=True)
+    discovery_thrad.start()
 
     print(f'Starting reverse proxy server listening to port {PORT}')
 
