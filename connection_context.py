@@ -1,6 +1,5 @@
 import ssl
 import time
-import errno
 import socket
 import selectors
 from enum import Enum
@@ -105,8 +104,8 @@ class ConnectionContext:
         """
         print('reading request')
         try:
-            data: bytes = self.client_sock.recv(4096)
-        except (BlockingIOError, ssl.SSLWantReadError): # if for some reason no data is found, do nothing
+            data = self.client_sock.recv(4096)
+        except (BlockingIOError, ssl.SSLWantReadError):
             return
         except Exception:
             self._close()
@@ -114,117 +113,96 @@ class ConnectionContext:
         
         if data:
             self.request_buffer += data
-        else: # no data = end of connection, so close
+        else:
             self._close()
             return
         
         if HEADER_DELIMITER in self.request_buffer:
             if not self.request_header_parsed:
-                request_head_raw, _, _ = self.request_buffer.partition(HEADER_DELIMITER)
-                self.request_head_raw_length = len(request_head_raw)
+                self._parse_request_headers()
 
-                try:
-                    request_line, request_headers = parse_request(request_head_raw) # this will be in the original casing
-                except ValueError:
-                    print('malformed request, sending back 400')
-                    self.response_buffer = b'400 bad request'
-                    self._set_write_client_state()
-                    return # CRITICAL: COULD NOT PARSE ERROR 400 BAD REQUEST
-                
-                self.method, self.path = request_line.split()[:2]
-
-                # maybe do validation on the request version ? or not because right now i have no version
-                
-                self.request_headers_lower = {key.lower(): value.lower() for key, value in request_headers.items()}
-
-                try:
-                    self.request_content_length: int = int(self.request_headers_lower.get('content-length', 0))
-                except Exception as e:
-                    print(f'Could not parse content length: {e}')
-                    return
-                
-                if 'connection' in self.request_headers_lower:
-                    self.keepalive = True if self.request_headers_lower.get('connection') != 'close' else False
-                    _request_connection_key = next(k for k in request_headers if k.lower() == 'connection')
-                    request_headers.pop(_request_connection_key)
-                    self.request_headers_lower.pop('connection')
-                
-                if message := ConnectionContext.CACHE.get_message(self.method, self.path): # get_request either returns the message if it is found, or empty bytes if cache miss (or timeout on cache hit)
-                    # maybe i need to do something like loading the message? what do i load to?
-                    print('cache hit')
-                    self.response_buffer = message
-                    self._set_write_client_state()
-                    return
-                
-                self.request_header_parsed = True
-                print('finished parsing header')
-            
-            if len(self.request_buffer) < self.request_head_raw_length + len(HEADER_DELIMITER) + self.request_content_length:
-                return # this means the message hasn't fully been read yet
-            
-            # moving past this part means the message has been fully read
-            
-            # reconstruct request_headers (add x-forward, x-proto, strip connection keep alive, etc.)
-            request_headers['X-Forwarded-For'] = f'{self.client_addr[0].replace("'", '')}' # type: ignore
-            request_headers['X-Forwarded-Proto'] = 'https'
-
-            request_body = self.request_buffer[self.request_head_raw_length + len(HEADER_DELIMITER):]
-            self.request_buffer = reconstruct_request(request_line, request_headers, request_body)
-            
-            if not self.backend_sock: # IMPORTANT: IF THE BACKEND SOCK ALR EXISTS, SKIP STRAIGHT TO WRITE_BACKEND
-                self._init_backend_conn()
-            else: # backend socket could alr exist if we are keep aliving
-                self.selector.modify(self.backend_sock, selectors.EVENT_WRITE, data=self)
-                self.selector.unregister(self.client_sock)
-                self.state = ProcessingStates.WRITE_BACKEND
-            # more logic here
-
-            print(self.request_buffer)
+            total_size = self.request_head_raw_length + len(HEADER_DELIMITER) + self.request_content_length
+            if len(self.request_buffer) >= total_size:
+                self._finalize_request_parsing()
     
-    def _confirm_backend_conn(self) -> None:
-        """
-        Called when backend_sock becomes writable (connection established)
-        checks SO_ERROR
-        if valid => update selector to write request -> state to WRITE_BACKEND
-        """
-        print('finishing connection')
-        if self.backend_sock and not (error_code := self.backend_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)):
-            # if you reach this point, it means you have finished the connection to the backend
-            self.state = ProcessingStates.WRITE_BACKEND
-        elif self._retries < ConnectionContext.MAX_RETRIES:
-            print(f'CRITICAL: Error occured when connecting to backend: {errno.errorcode.get(error_code)}') # errno for more descriptive error messages
-            
-            ConnectionContext.FAILED_SERVERS[self.backend_addr] = ConnectionContext.FAILED_SERVERS.get(self.backend_addr, 0) + 1
+    def _parse_request_headers(self):
+        request_head_raw, _, _ = self.request_buffer.partition(HEADER_DELIMITER)
+        self.request_head_raw_length = len(request_head_raw)
 
-            if ConnectionContext.FAILED_SERVERS[self.backend_addr] > ConnectionContext.FAILURE_THRESHOLD and self.backend_addr:
-                try:
-                    print(f'CRITICAL: Failure threshold {ConnectionContext.FAILURE_THRESHOLD} hit on server {self.backend_addr}, removing')
-                    ConnectionContext.LOAD_BALANCER._remove_server(self.backend_addr)
-                    del ConnectionContext.FAILED_SERVERS[self.backend_addr]
-                except KeyError:
-                    pass
-
-            print(ConnectionContext.FAILED_SERVERS)
-            if self.backend_sock:
-                try:
-                    self.selector.unregister(self.backend_sock)
-                    self.backend_sock.close()
-                except (KeyError, OSError):
-                    pass
-                self.backend_sock = None
-            if self.backend_addr:
-                self.backend_addr = None
-            
-            print(f'Trying again with new backend. Attempt {self._retries}/{ConnectionContext.MAX_RETRIES}')
-            self._retries += 1
-            self._init_backend_conn()
-            return
-        else:
-            print('502 bad gateway')
-            self.response_buffer = b'502 bad gateway'
+        try:
+            self.request_line, self.request_headers = parse_request(request_head_raw)
+        except ValueError:
+            self.response_buffer = b'400 bad request'
             self._set_write_client_state()
             return
-            # at this point return bad gateway
+
+        self.method, self.path = self.request_line.split()[:2]
+        self.request_headers_lower = {k.lower(): v.lower() for k, v in self.request_headers.items()}
+        self.request_content_length = int(self.request_headers_lower.get('content-length', 0))
+
+        self.keepalive = self.request_headers_lower.get('connection') != 'close'
+        
+        keys_to_remove = [k for k in self.request_headers if k.lower() == 'connection'] # no need to keep-alive on the back end: hop-by-hop header
+        for k in keys_to_remove: 
+            self.request_headers.pop(k, None)
+
+        if message := ConnectionContext.CACHE.get_message(self.method, self.path):
+            print('Cache hit')
+            self.response_buffer = message
+            self._set_write_client_state()
+            return
+
+        self.request_header_parsed = True
+
+    def _finalize_request_parsing(self):
+        self.request_headers['X-Forwarded-For'] = self.client_addr[0]
+        self.request_headers['X-Forwarded-Proto'] = 'https'
+        
+        request_body = self.request_buffer[self.request_head_raw_length + len(HEADER_DELIMITER):]
+        self.request_buffer = reconstruct_request(self.request_line, self.request_headers, request_body)
+        
+        if not self.backend_sock:
+            self._init_backend_conn()
+        else:
+            self.selector.modify(self.backend_sock, selectors.EVENT_WRITE, data=self)
+            self.selector.unregister(self.client_sock)
+            self.state = ProcessingStates.WRITE_BACKEND
+
+    def _confirm_backend_conn(self) -> None:
+        if self.backend_sock:
+            err = self.backend_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if err == 0:
+                self.state = ProcessingStates.WRITE_BACKEND
+                return
+        # if you reach past this point, it means ur connection has failed
+        print('Backend connection failed')
+        
+        if self.backend_addr:
+            ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr) # make sure to avoid leaks on the load balancer
+            
+            ConnectionContext.FAILED_SERVERS[self.backend_addr] = ConnectionContext.FAILED_SERVERS.get(self.backend_addr, 0) + 1
+            if ConnectionContext.FAILED_SERVERS[self.backend_addr] >= ConnectionContext.FAILURE_THRESHOLD:
+                print(f"Removing failing server {self.backend_addr}")
+                ConnectionContext.LOAD_BALANCER._remove_server(self.backend_addr)
+                del ConnectionContext.FAILED_SERVERS[self.backend_addr]
+            
+            self.backend_addr = None
+
+        if self.backend_sock:
+            try:
+                self.selector.unregister(self.backend_sock)
+                self.backend_sock.close()
+            except (KeyError, OSError): 
+                pass
+            self.backend_sock = None
+
+        if self._retries < ConnectionContext.MAX_RETRIES:
+            self._retries += 1
+            print(f"Retrying backend... ({self._retries})")
+            self._init_backend_conn()
+        else:
+            self.response_buffer = b'502 bad gateway'
+            self._set_write_client_state()
     
     def _write_request(self) -> None:
         """
@@ -238,78 +216,79 @@ class ConnectionContext:
                 if not sent:
                     return # CRITICAL: THIS IS AN ERROR, IT MEANS THE BACKEND HAS NOT BEEN CONNECTED
                 self.request_buffer = self.request_buffer[sent:] # so use that info to clear the buffer
-            except BlockingIOError:
+            except (BlockingIOError, ssl.SSLWantWriteError):
                 pass
+            except (BrokenPipeError, ConnectionResetError):
+                print("Backend closed connection unexpectedly")
+                self._close_backend_only()
+                self.response_buffer = b'502 bad gateway'
+                self._set_write_client_state()
+                return
         
         if self.backend_sock and not self.request_buffer:
             self.selector.modify(self.backend_sock, selectors.EVENT_READ, data=self) # if everything is sent, change back to EVENT_READ to avoid excessively pinging
             self.state = ProcessingStates.READ_BACKEND
 
     def _read_response(self) -> None:
-        """
-        Reads from backend_sock into response_buffer
-        parses response_headers for Content-Length
-        if full body received -> close backend -> state to WRITE_CLEINT
-        """
-        print('reading response')
         try:
-            if self.backend_sock:
-                data: bytes = self.backend_sock.recv(4096)
-        except BlockingIOError: # if for some reason no data is found, do nothing
+            data = self.backend_sock.recv(4096) # type: ignore
+        except BlockingIOError:
+            return
+        except Exception:
+            self.response_buffer = b'502 bad gateway'
+            self._set_write_client_state()
             return
         
         if data:
             self.response_buffer += data
-        else: # DO I NEED THIS LINE?
-            self._close()
+        else:
+            if not self.response_header_parsed:
+                self.response_buffer = b'502 bad gateway'
+            self._set_write_client_state()
+            return
+
+        if HEADER_DELIMITER in self.response_buffer and not self.response_header_parsed:
+            self._parse_response_headers()
+
+        if self.response_header_parsed:
+            total_len = self.response_head_raw_length + len(HEADER_DELIMITER) + self.response_content_length
+            if len(self.response_buffer) >= total_len:
+                self._finalize_response()
+
+    def _parse_response_headers(self):
+        response_head_raw, _, _ = self.response_buffer.partition(HEADER_DELIMITER)
+        self.response_head_raw_length = len(response_head_raw)
+        try:
+            self.response_line, self.response_headers = parse_response(response_head_raw)
+        except ValueError:
+            self.response_buffer = b'502 bad gateway'
+            self._set_write_client_state()
             return
         
-        if HEADER_DELIMITER in self.response_buffer:
-            if not self.response_header_parsed:
-                response_head_raw, _, response_remaining_bytes = self.response_buffer.partition(HEADER_DELIMITER)
-                self.response_head_raw_length = len(response_head_raw)
+        self.response_headers_lower = {k.lower(): v.lower() for k, v in self.response_headers.items()}
+        self.response_content_length = int(self.response_headers_lower.get('content-length', 0))
+        self.response_header_parsed = True
 
-                try:
-                    self.response_line, self.response_headers = parse_response(response_head_raw)
-                except ValueError:
-                    return # CRITICAL: COULD NOT PARSE ERROR INTERNAL SERVER ERROR
-                
-                self.response_headers_lower = {key.lower(): value.lower() for key, value in self.response_headers.items()} # you need self here since you'll check it again for gzipping/cache
+    def _finalize_response(self):
+        body = self.response_buffer[self.response_head_raw_length + len(HEADER_DELIMITER):]
+        
+        if 'accept-encoding' in self.request_headers_lower and 'gzip' in self.request_headers_lower['accept-encoding']:
+            if 'content-encoding' not in self.response_headers_lower:
+                body = compress_response(body)
+                self.response_headers['Content-Encoding'] = 'gzip'
+                self.response_headers['Content-Length'] = str(len(body))
 
-                try:
-                    self.response_content_length: int = int(self.response_headers_lower.get('content-length', 0))
-                except Exception as e:
-                    print(f'Could not parse content length: {e}')
-                    return
-                
-                self.response_header_parsed = True
+        self.response_buffer = reconstruct_response(self.response_line, self.response_headers, body)
 
-            # after the response has been loaded:
-            # look up content length and make sure it has been loaded fully
-            if len(self.response_buffer) < self.response_head_raw_length + len(HEADER_DELIMITER) + self.response_content_length:
-                return
-            
-            # if no compression, just return the response buffer, otherwise i will need to reconstruct it
-            response_body = self.response_buffer[self.response_head_raw_length + len(HEADER_DELIMITER):]
+        if 'cache-control' in self.response_headers_lower:
+            if max_age := get_cache_control(self.response_headers_lower['cache-control']):
+                ConnectionContext.CACHE.add_message(self.method, self.path, self.response_buffer, max_age)
 
-            # think about gzipping (look up accept-encoding)
-            if 'accept-encoding' in self.request_headers_lower and 'content-encoding' not in self.response_headers_lower:
-                if 'gzip' in self.request_headers_lower['accept-encoding']:
-                    response_body = compress_response(response_body)
-                    self.response_headers['Content-Length'] = str(len(response_body))
-                    self.response_headers['Content-Encoding'] = 'gzip'
-
-            self.response_buffer = reconstruct_response(self.response_line, self.response_headers, response_body)
-
-            if 'cache-control' in self.response_headers_lower:
-                if max_age := get_cache_control(self.response_headers_lower['cache-control']):
-                    ConnectionContext.CACHE.add_message(self.method, self.path, self.response_buffer, max_age)
-                    print('added to cache')
-
-            # print(self.response_buffer)
-            self._set_write_client_state()
+        self._set_write_client_state()
     
     def _set_write_client_state(self):
+        self._close_backend_only()
+        
         try:
             self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
         except (ValueError, KeyError):
@@ -330,6 +309,9 @@ class ConnectionContext:
                 self.response_buffer = self.response_buffer[sent:] # so use that info to clear the buffer
             except BlockingIOError:
                 pass
+            except Exception:
+                self.state = ProcessingStates.CLEANUP
+                return
         
         if self.client_sock and not self.response_buffer:
             try:
@@ -342,6 +324,8 @@ class ConnectionContext:
                     return
             except AttributeError:
                 pass
+            except Exception:
+                self.state = ProcessingStates.CLEANUP
             print('no keepalive')
             self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
             self.state = ProcessingStates.CLEANUP
@@ -379,6 +363,19 @@ class ConnectionContext:
             self.selector.unregister(self.client_sock)
         except KeyError:
             pass
+
+    def _close_backend_only(self):
+        if self.backend_sock:
+            try:
+                self.selector.unregister(self.backend_sock)
+                self.backend_sock.close()
+            except (KeyError, OSError): 
+                pass
+            self.backend_sock = None
+            
+        if self.backend_addr:
+            ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr)
+            self.backend_addr = None
 
     def _close(self) -> None:
         print('closing down connection')
