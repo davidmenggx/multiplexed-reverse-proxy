@@ -37,12 +37,13 @@ class ConnectionPool:
 
     def get_connection(self, addr: tuple[str, int]) -> socket.socket:
         print('fetching connection from pool')
+        print(self.pool[addr])
         with self.pool_lock:
             if addr in self.pool:
                 queue = self.pool[addr]
                 while queue:
-                    sock, _ = queue.popleft()
-                    if self._is_socket_alive(sock):
+                    sock, expiration = queue.popleft()
+                    if (time.time() - expiration < self.MAX_LIFETIME) and self._is_socket_alive(sock):
                         return sock
                     sock.close()
         return self._create_connection(addr)
@@ -51,7 +52,7 @@ class ConnectionPool:
         try:
             with self.pool_lock:
                 if addr in self.pool and len(self.pool[addr]) < self.POOL_MAXSIZE:
-                    self.pool[addr].append((sock, time.monotonic()))
+                    self.pool[addr].append((sock, time.time()))
                     print(f'added connection back to pool: {self.pool}')
                 else:
                     sock.close()
@@ -62,7 +63,7 @@ class ConnectionPool:
     
     def cleanup(self) -> None:
         print('cleaning up connection pool')
-        current_time = time.monotonic()
+        current_time = time.time()
         with self.pool_lock:
             print(f'Number of connections before cleanup: {sum(len(self.pool[server]) for server in self.pool)}')
             for addr in list(self.pool.keys()):
@@ -73,4 +74,5 @@ class ConnectionPool:
                         new_deque.append((sock, timestamp))
                     else:
                         sock.close()
+                self.pool[addr] = new_deque
             print(f'Number of connections after cleanup: {sum(len(self.pool[server]) for server in self.pool)}')
