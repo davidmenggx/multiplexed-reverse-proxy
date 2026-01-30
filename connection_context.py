@@ -6,6 +6,7 @@ from enum import Enum
 
 from cache import Cache
 from load_balancer import LoadBalancer
+from connection_pool import ConnectionPool
 from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response, get_cache_control, compress_response
 
 HEADER_DELIMITER = b'\r\n\r\n'
@@ -26,6 +27,7 @@ class ConnectionContext:
     CACHE: Cache
     LOAD_BALANCER: LoadBalancer
     TIMEOUT: int
+    POOL: ConnectionPool
 
     def __init__(self, selector: selectors.BaseSelector, 
                 sock: ssl.SSLSocket, 
@@ -353,10 +355,8 @@ class ConnectionContext:
         if not self.backend_addr:
             ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
         
+        self.backend_sock = ConnectionContext.POOL.get_connection(self.backend_addr)
         self.state = ProcessingStates.CONNECT_BACKEND
-        self.backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.backend_sock.setblocking(False)
-        self.backend_sock.connect_ex(self.backend_addr)
 
         self.selector.register(self.backend_sock, selectors.EVENT_WRITE, data=self)
         try:
@@ -368,7 +368,9 @@ class ConnectionContext:
         if self.backend_sock:
             try:
                 self.selector.unregister(self.backend_sock)
-                self.backend_sock.close()
+                release_successful = self.POOL.release_connection(self.backend_addr, self.backend_sock) # type: ignore
+                if not release_successful:
+                    ... # CRITICAL RETURN SERVER ERROR
             except (KeyError, OSError): 
                 pass
             self.backend_sock = None
@@ -395,7 +397,9 @@ class ConnectionContext:
                 except (KeyError, ValueError): 
                     pass
                 print('closing backend socket')
-                self.backend_sock.close()
+                release_successful = self.POOL.release_connection(self.backend_addr, self.backend_sock) # type: ignore
+                if not release_successful:
+                    ... # CRITICAL RETURN SERVER ERROR
             if self.backend_addr:
                 ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr)
                 self.backend_addr = None

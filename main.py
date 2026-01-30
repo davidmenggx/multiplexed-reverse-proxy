@@ -9,6 +9,7 @@ from ssl import SSLContext, PROTOCOL_TLS_SERVER
 
 from cache import Cache
 from load_balancer import LoadBalancer
+from connection_pool import ConnectionPool
 from connection_context import ConnectionContext
 
 # Parse command line arguments
@@ -19,6 +20,9 @@ parser.add_argument('-d', '--discovery', type=int, default=49152, help='Port for
 parser.add_argument('-t', '--threshold', type=int, default=3, help='Max number of failed connections before server is removed from load balancer')
 parser.add_argument('-r', '--retries', type=int, default=5, help='Max number of connection retries until error')
 parser.add_argument('-k', '--keepalive', type=int, default=3, help='Duration in seconds before keep-alive connections are timed-out')
+parser.add_argument('-m', '--maxsize', type=int, default=10, help='Maximum number of connections in pool for each server')
+parser.add_argument('-e', '--expiration', type=int, default=10, help='Expiration time before connections in pool are discarded')
+parser.add_argument('-f', '--frequency', type=int, default=10, help='Duration in seconds between connection pool cleaning for expired connections')
 
 args = parser.parse_args()
 
@@ -41,6 +45,15 @@ if args.retries < 0:
 if args.keepalive < 0:
     raise ValueError(f'FATAL: Keep-alive time cannot be negative! Currently {args.keepalive}')
 
+if args.maxsize < 0:
+    raise ValueError(f'FATAL: Connection pool max-size cannot be negative! Currently {args.maxsize}')
+
+if args.expiration < 0:
+    raise ValueError(f'FATAL: Connection pool expiration time cannot be negative! Currently {args.expiration}')
+
+if args.frequency < 0:
+    raise ValueError(f'FATAL: Connection pool cleanup frequency cannot be negative! Currently {args.frequency}')
+
 HOST = ''
 PORT = args.port
 
@@ -57,6 +70,7 @@ ConnectionContext.MAX_RETRIES = args.retries
 ConnectionContext.CACHE = Cache()
 ConnectionContext.LOAD_BALANCER = LoadBalancer(algorithm=LOAD_BALANCING_ALGORITHM)
 ConnectionContext.TIMEOUT = args.keepalive
+ConnectionContext.POOL = ConnectionPool(args.maxsize, args.expiration)
 
 # Shut the server down
 RUNNING = True
@@ -155,6 +169,12 @@ def discover_servers() -> None:
     except Exception as e:
         print(f"CRITICAL: Discovery thread crashed: {e}")
 
+def cleanup_pool() -> None:
+    print('beginning connection pool cleanup cycle')
+    while RUNNING:
+        time.sleep(args.frequency)
+        ConnectionContext.POOL.cleanup()
+
 def main() -> None:
     """
     Manages ready to read sockets depending on state
@@ -183,6 +203,9 @@ def main() -> None:
 if __name__ == '__main__':
     discovery_thrad = threading.Thread(target=discover_servers, daemon=True)
     discovery_thrad.start()
+
+    cleanup_thread = threading.Thread(target=cleanup_pool, daemon=True)
+    cleanup_thread.start()
 
     print(f'Starting reverse proxy server listening to port {PORT}')
 

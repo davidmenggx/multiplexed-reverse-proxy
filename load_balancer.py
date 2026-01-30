@@ -62,6 +62,7 @@ class LoadBalancer:
     
     def _add_server(self, server: tuple[str, int]) -> None: # there need to parms here too
         with self._lock:
+            print(self.servers_dict)
             if server not in self.servers_dict:
                 self.servers_dict[server] = 0
                 self.servers_list = list(self.servers_dict.keys())
