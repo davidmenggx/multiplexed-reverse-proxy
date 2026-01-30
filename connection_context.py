@@ -1,6 +1,7 @@
 import ssl
 import time
 import socket
+import logging
 import selectors
 from enum import Enum
 
@@ -8,6 +9,8 @@ from cache import Cache
 from load_balancer import LoadBalancer
 from connection_pool import ConnectionPool
 from utilities import parse_request, reconstruct_request, parse_response, reconstruct_response, get_cache_control, compress_response
+
+LOGGER = logging.getLogger('reverse_proxy')
 
 HEADER_DELIMITER = b'\r\n\r\n'
 
@@ -81,7 +84,6 @@ class ConnectionContext:
             self._close()
     
     def _handshake(self) -> None:
-        print('starting TLS handshake')
         try:
             self.client_sock.do_handshake()
         except ssl.SSLWantReadError:
@@ -91,7 +93,7 @@ class ConnectionContext:
             self.selector.modify(self.client_sock, selectors.EVENT_WRITE, data=self)
             return
         except Exception as e:
-            print(f'An unexpected exception occurred on TLS handshake: {e}')
+            LOGGER.warning(f'An unexpected exception occurred on TLS handshake: {e}')
             self._close()
             return
         
@@ -104,7 +106,6 @@ class ConnectionContext:
         checks for header delimiter
         if request_headers found -> parse -> check cache -> (connect backend or write client)
         """
-        print('reading request')
         try:
             data = self.client_sock.recv(4096)
         except (BlockingIOError, ssl.SSLWantReadError):
@@ -149,7 +150,6 @@ class ConnectionContext:
             self.request_headers.pop(k, None)
 
         if message := ConnectionContext.CACHE.get_message(self.method, self.path):
-            print('Cache hit')
             self.response_buffer = message
             self._set_write_client_state()
             return
@@ -177,14 +177,14 @@ class ConnectionContext:
                 self.state = ProcessingStates.WRITE_BACKEND
                 return
         # if you reach past this point, it means ur connection has failed
-        print('Backend connection failed')
+        LOGGER.warning('Backend connection failed')
         
         if self.backend_addr:
             ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr) # make sure to avoid leaks on the load balancer
             
             ConnectionContext.FAILED_SERVERS[self.backend_addr] = ConnectionContext.FAILED_SERVERS.get(self.backend_addr, 0) + 1
             if ConnectionContext.FAILED_SERVERS[self.backend_addr] >= ConnectionContext.FAILURE_THRESHOLD:
-                print(f"Removing failing server {self.backend_addr}")
+                LOGGER.warning(f"Removing failing server {self.backend_addr}")
                 ConnectionContext.LOAD_BALANCER._remove_server(self.backend_addr)
                 del ConnectionContext.FAILED_SERVERS[self.backend_addr]
             
@@ -200,7 +200,7 @@ class ConnectionContext:
 
         if self._retries < ConnectionContext.MAX_RETRIES:
             self._retries += 1
-            print(f"Retrying backend... ({self._retries})")
+            LOGGER.debug(f"Retrying backend... ({self._retries})")
             self._init_backend_conn()
         else:
             self.response_buffer = b'502 bad gateway'
@@ -211,7 +211,6 @@ class ConnectionContext:
         Sends request_buffer to backend_sock
         if buffer empty -> update selector to read response -> state to READ_BACKEND
         """
-        print('writing request')
         if self.backend_sock and self.request_buffer:
             try:
                 sent = self.backend_sock.send(self.request_buffer) # .send returns the # of bytes sent
@@ -221,7 +220,7 @@ class ConnectionContext:
             except (BlockingIOError, ssl.SSLWantWriteError):
                 pass
             except (BrokenPipeError, ConnectionResetError):
-                print("Backend closed connection unexpectedly")
+                LOGGER.critical("Backend closed connection unexpectedly")
                 self._close_backend_only()
                 self.response_buffer = b'502 bad gateway'
                 self._set_write_client_state()
@@ -302,7 +301,6 @@ class ConnectionContext:
         Sends response_buffer to client_sock
         if buffer empty -> state to CLEANUP
         """
-        print('writing client')
         if self.client_sock and self.response_buffer:
             try:
                 sent = self.client_sock.send(self.response_buffer) # .send returns the # of bytes sent
@@ -322,13 +320,11 @@ class ConnectionContext:
 
                     self.state = ProcessingStates.READ_REQUEST
                     self._init_connection_info()
-                    print('keepalive, going back to read request')
                     return
             except AttributeError:
                 pass
             except Exception:
                 self.state = ProcessingStates.CLEANUP
-            print('no keepalive')
             self.selector.modify(self.client_sock, selectors.EVENT_READ, data=self)
             self.state = ProcessingStates.CLEANUP
 
@@ -340,18 +336,15 @@ class ConnectionContext:
         registers backend_sock with Selector (WRITE_BACKEND), passing self as data
         pauses client_sock (unregister or remove selectors.EVENT_READ) to stop buffering
         """
-        print('initializing backend connection')
         # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
         try:
             self.backend_addr = ConnectionContext.LOAD_BALANCER.get_server(self.client_addr[0]) # type: ignore
-            print(f'Got server: {self.backend_addr}')
         except (ValueError, ZeroDivisionError):
-            print('CRITICAL: Failed to find backend server')
+            LOGGER.critical('Failed to find backend server')
             self.response_buffer = b'503 service unavailable'
             self._set_write_client_state()
             return
         ConnectionContext.LOAD_BALANCER._increment_connection(self.backend_addr)
-        print(ConnectionContext.LOAD_BALANCER.servers_dict)
         if not self.backend_addr:
             ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
         
@@ -380,23 +373,18 @@ class ConnectionContext:
             self.backend_addr = None
 
     def _close(self) -> None:
-        print('closing down connection')
         try:
             if self.client_sock:
                 try:
-                    print('unregistering client socket')
                     self.selector.unregister(self.client_sock)
                 except (KeyError, ValueError): 
                     pass
-                print('closing client socket')
                 self.client_sock.close()
             if self.backend_sock:
                 try:
-                    print('unregistering backend socket')
                     self.selector.unregister(self.backend_sock)
                 except (KeyError, ValueError): 
                     pass
-                print('closing backend socket')
                 release_successful = self.POOL.release_connection(self.backend_addr, self.backend_sock) # type: ignore
                 if not release_successful:
                     ... # CRITICAL RETURN SERVER ERROR
@@ -404,5 +392,4 @@ class ConnectionContext:
                 ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr)
                 self.backend_addr = None
         except Exception as e:
-            print(f'error during close: {e}')
-        print('everything closed')
+            LOGGER.critical(f'Error closing {self.client_addr}: {e}')

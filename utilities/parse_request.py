@@ -20,15 +20,3 @@ def parse_request(header: bytes) -> tuple[str, dict[str, str]]: # returns (reque
     request_headers_decoded = {key.decode('utf-8'): value.decode('utf-8') for key, value in request_headers_raw_dict.items()}
     
     return request_line_decoded, request_headers_decoded
-
-if __name__ == '__main__': # quick test
-    sample_request_header = (
-        "GET /index.html HTTP/1.1\r\n"
-        "Host: api.example.com\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: 9\r\n"
-        "Accept-Encoding: gzip\r\n"
-        "Connection: Keep-Alive"
-    ).encode('utf-8')
-    print(parse_request(sample_request_header))
-    # returns ('GET /index.html HTTP/1.1', {'Host': 'api.example.com', 'Content-Type': 'application/json', 'Content-Length': '9', 'Accept-Encoding': 'gzip', 'Connection': 'Keep-Alive'})

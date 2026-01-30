@@ -13,4 +13,4 @@ class Cache:
         return b''
     
     def add_message(self, method: str, path: str, message: bytes, max_age: float) -> None:
-        self.cache[(method, path)] = (message, time.time() + max_age) # ADD MAX_AGE TO CURRENT TIME
+        self.cache[(method, path)] = (message, time.time() + max_age)

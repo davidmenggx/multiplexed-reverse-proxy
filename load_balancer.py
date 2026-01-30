@@ -1,6 +1,9 @@
 import json
 import random
+import logging
 import threading
+
+LOGGER = logging.getLogger('reverse_proxy')
 
 SERVERS_FILEPATH = 'servers.json'
 
@@ -20,11 +23,10 @@ class LoadBalancer:
 
             self.ROUND_ROBIN_COUNTER = 0
             
-            print(self.servers_list)
         except KeyError as e:
-            print(f'Error: Missing expected key in JSON: {e}')
+            LOGGER.critical(f'Error: Missing expected key in JSON: {e}')
         except Exception as e:
-            print(f'Initialization failed: {e}')
+            LOGGER.critical(f'Initialization failed: {e}')
 
     def get_server(self, ip: str) -> tuple[str, int]:
         with self._lock:
@@ -62,25 +64,24 @@ class LoadBalancer:
     
     def _add_server(self, server: tuple[str, int]) -> None: # there need to parms here too
         with self._lock:
-            print(self.servers_dict)
             if server not in self.servers_dict:
                 self.servers_dict[server] = 0
                 self.servers_list = list(self.servers_dict.keys())
-                print(f'Added server: {server}')
+                LOGGER.info(f'Added server: {server}')
     
     def _remove_server(self, server: tuple[str, int]) -> None:
         with self._lock:
             if server in self.servers_dict:
                 del self.servers_dict[server]
                 self.servers_list = list(self.servers_dict.keys())
-                print(f'LoadBalancer: Removed server {server}')
+                LOGGER.info(f'Removed server: {server}')
     
     def _increment_connection(self, server: tuple[str, int]) -> None:
         with self._lock:
             if server in self.servers_dict:
                 self.servers_dict[server] += 1
             else:
-                print(f"Warning: Tries to increment unknown server {server}")
+                LOGGER.warning(f"Proxy attempts to increment unknown server {server}")
     
     def _decrement_connection(self, server: tuple[str, int]) -> None:
         with self._lock:
@@ -88,53 +89,6 @@ class LoadBalancer:
                 self.servers_dict[server] -= 1
                 if self.servers_dict[server] < 0:
                     self.servers_dict[server] = 0
-                    print(f"FATAL: Negative connections detected for {server}")
+                    LOGGER.critical(f"Negative connections detected for {server}")
             else:
-                print(f"Warning: Tries to decrement unknown server {server}")
-
-if __name__ == '__main__':
-    sample_addr = ('127.0.0.1', 8000)
-
-    testing_load_balancer = LoadBalancer('LEAST_CONNECTIONS')
-    print(f'All servers: {testing_load_balancer.servers_dict}')
-
-    print('-------')
-    
-    random_server = testing_load_balancer._get_random_server()
-    print(f'Random server: {random_server}')
-
-    print('-------')
-    
-    round_robin_1 = testing_load_balancer._get_round_robin_server()
-    print(f'Round Robin server 1: {round_robin_1}')
-
-    round_robin_2 = testing_load_balancer._get_round_robin_server()
-    print(f'Round Robin server 2: {round_robin_2}')
-
-    print('-------')
-    
-    least_conn_server = testing_load_balancer._get_least_connections_server()
-    print(f'Least connections server: {least_conn_server}')
-
-    print('-------')
-    
-    ip_hash_server = testing_load_balancer._get_ip_hash_server(sample_addr[0])
-    print(f'IP hash server for {sample_addr}: {ip_hash_server}')
-
-    print('-------')
-    testing_load_balancer._increment_connection(('127.0.0.1', 8080))
-    print(testing_load_balancer.servers_dict)
-    testing_load_balancer._decrement_connection(('127.0.0.1', 8080))
-    print(testing_load_balancer.servers_dict)
-    testing_load_balancer._decrement_connection(('127.0.0.1', 8080))
-    print(testing_load_balancer.servers_dict)
-
-    print('-------')
-    testing_load_balancer._add_server(('1.2.3.4', 8080))
-    print(testing_load_balancer.servers_dict)
-    print(testing_load_balancer.servers_list)
-
-    print('-------')
-    testing_load_balancer._remove_server(('1.2.3.4', 8080))
-    print(testing_load_balancer.servers_dict)
-    print(testing_load_balancer.servers_list)
+                LOGGER.warning(f"Proxy attempts to decrement unknown server {server}")

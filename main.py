@@ -2,6 +2,7 @@ import ssl
 import time
 import socket
 import signal
+import logging
 import argparse
 import selectors
 import threading
@@ -19,10 +20,11 @@ parser.add_argument('-l', '--loadbal', type=str, default='LEAST_CONNECTIONS', he
 parser.add_argument('-d', '--discovery', type=int, default=49152, help='Port for server discovery')
 parser.add_argument('-t', '--threshold', type=int, default=3, help='Max number of failed connections before server is removed from load balancer')
 parser.add_argument('-r', '--retries', type=int, default=5, help='Max number of connection retries until error')
-parser.add_argument('-k', '--keepalive', type=int, default=3, help='Duration in seconds before keep-alive connections are timed-out')
+parser.add_argument('-k', '--keepalive', type=float, default=3, help='Duration in seconds before keep-alive connections are timed-out')
 parser.add_argument('-m', '--maxsize', type=int, default=10, help='Maximum number of connections in pool for each server')
-parser.add_argument('-e', '--expiration', type=int, default=10, help='Expiration time before connections in pool are discarded')
-parser.add_argument('-f', '--frequency', type=int, default=10, help='Duration in seconds between connection pool cleaning for expired connections')
+parser.add_argument('-e', '--expiration', type=float, default=10, help='Expiration time before connections in pool are discarded')
+parser.add_argument('-f', '--frequency', type=float, default=10, help='Duration in seconds between connection pool cleaning for expired connections')
+parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Enable verbose mode')
 
 args = parser.parse_args()
 
@@ -72,6 +74,28 @@ ConnectionContext.LOAD_BALANCER = LoadBalancer(algorithm=LOAD_BALANCING_ALGORITH
 ConnectionContext.TIMEOUT = args.keepalive
 ConnectionContext.POOL = ConnectionPool(args.maxsize, args.expiration)
 
+# Create logger
+LOGGER = logging.getLogger('reverse_proxy')
+_console_handler = logging.StreamHandler()
+_file_handler = logging.FileHandler('proxy.log')
+if args.verbose:
+    LOGGER.setLevel(logging.DEBUG)
+    _console_handler.setLevel(logging.DEBUG)
+    _file_handler.setLevel(logging.DEBUG)
+else:
+    LOGGER.setLevel(logging.WARNING)
+    _console_handler.setLevel(logging.WARNING)
+    _file_handler.setLevel(logging.WARNING)
+
+_log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+_date_format = "%Y-%m-%dT%H:%M:%SZ" # ISO 8601 style
+_formatter = logging.Formatter(fmt=_log_format, datefmt=_date_format)
+_console_handler.setFormatter(_formatter)
+_file_handler.setFormatter(_formatter)
+
+LOGGER.addHandler(_console_handler)
+LOGGER.addHandler(_file_handler)
+
 # Shut the server down
 RUNNING = True
 def signal_shutdown(_sig, _frame) -> None:
@@ -115,7 +139,7 @@ def accept_connection(sock) -> None:
     
     sel.register(ssl_conn, selectors.EVENT_READ, data=connection_context)
     
-    print(f'Accepted and registered connection from {addr}')
+    LOGGER.debug(f'Accepted and registered connection from {addr}')
 
 def discover_servers() -> None:
     """
@@ -129,9 +153,9 @@ def discover_servers() -> None:
             try:
                 discovery_sock.bind((HOST, DISCOVERY_PORT))
                 discovery_sock.listen() 
-                print(f'Discovery thread listening to port {DISCOVERY_PORT}')
+                LOGGER.debug(f'Discovery thread listening to port {DISCOVERY_PORT}')
             except OSError as e:
-                print(f"CRITICAL: Discovery thread failed to bind port {DISCOVERY_PORT}: {e}")
+                LOGGER.critical(f"Discovery thread failed to bind port {DISCOVERY_PORT}: {e}")
                 return
 
             buffer = ""
@@ -159,18 +183,17 @@ def discover_servers() -> None:
                                         ip, port = message.split(',')
                                         if ConnectionContext.LOAD_BALANCER:
                                             ConnectionContext.LOAD_BALANCER._add_server((ip, int(port)))
-                                            print(f'Registered server: {ip}:{port}')
+                                            LOGGER.debug(f'Registered server: {ip}:{port}')
                                     except ValueError:
-                                        print(f"Ignored malformed discovery msg: {message}")
+                                        LOGGER.warning(f"Ignored malformed discovery msg: {message}")
                     except socket.timeout:
-                        print("Warning: Discovery connection timed out")
+                        LOGGER.warning("Discovery connection timed out")
                     except Exception as e:
-                        print(f"Discovery error: {e}")
+                        LOGGER.warning(f"Discovery error: {e}")
     except Exception as e:
-        print(f"CRITICAL: Discovery thread crashed: {e}")
+        LOGGER.critical(f"Discovery thread crashed: {e}")
 
 def cleanup_pool() -> None:
-    print('beginning connection pool cleanup cycle')
     while RUNNING:
         time.sleep(args.frequency)
         ConnectionContext.POOL.cleanup()
@@ -195,7 +218,7 @@ def main() -> None:
             if context is None:
                 continue
             if current_time - context.last_active > ConnectionContext.TIMEOUT:
-                print(f"Connection from {context.client_addr} timed out.")
+                LOGGER.debug(f"Connection from {context.client_addr} timed out.")
                 context._close()
     sel.close()
     lsock.close()
@@ -207,8 +230,8 @@ if __name__ == '__main__':
     cleanup_thread = threading.Thread(target=cleanup_pool, daemon=True)
     cleanup_thread.start()
 
-    print(f'Starting reverse proxy server listening to port {PORT}')
+    LOGGER.debug(f'Starting reverse proxy server listening to port {PORT}')
 
     main()
 
-    print('Reverse proxy server closed')
+    LOGGER.debug('Reverse proxy server closed')

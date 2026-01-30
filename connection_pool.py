@@ -1,8 +1,11 @@
 import time
 import errno
 import socket
+import logging
 import threading
 from collections import deque, defaultdict
+
+LOGGER = logging.getLogger('reverse_proxy')
 
 class ConnectionPool:    
     def __init__(self, maxsize: int, maxlifetime: int) -> None:
@@ -12,7 +15,7 @@ class ConnectionPool:
         self.MAX_LIFETIME = maxlifetime
     
     def _create_connection(self, addr: tuple[str, int]) -> socket.socket:
-        print('creating persistent backend socket')
+        LOGGER.debug(f'Creating new persistent backend socket for server {addr}')
         backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         backend_sock.setblocking(False)
 
@@ -36,8 +39,6 @@ class ConnectionPool:
         return False # if there is still stale data remaining in the socket, don't use it
 
     def get_connection(self, addr: tuple[str, int]) -> socket.socket:
-        print('fetching connection from pool')
-        print(self.pool[addr])
         with self.pool_lock:
             if addr in self.pool:
                 queue = self.pool[addr]
@@ -53,7 +54,7 @@ class ConnectionPool:
             with self.pool_lock:
                 if addr in self.pool and len(self.pool[addr]) < self.POOL_MAXSIZE:
                     self.pool[addr].append((sock, time.time()))
-                    print(f'added connection back to pool: {self.pool}')
+                    LOGGER.debug(f'Added connection back to pool for server {addr}')
                 else:
                     sock.close()
                 return True
@@ -62,10 +63,9 @@ class ConnectionPool:
             return False
     
     def cleanup(self) -> None:
-        print('cleaning up connection pool')
+        LOGGER.debug('Cleaning up connection pool for expired connections')
         current_time = time.time()
         with self.pool_lock:
-            print(f'Number of connections before cleanup: {sum(len(self.pool[server]) for server in self.pool)}')
             for addr in list(self.pool.keys()):
                 deque_obj = self.pool[addr]
                 new_deque = deque()
@@ -75,4 +75,3 @@ class ConnectionPool:
                     else:
                         sock.close()
                 self.pool[addr] = new_deque
-            print(f'Number of connections after cleanup: {sum(len(self.pool[server]) for server in self.pool)}')
