@@ -1,4 +1,5 @@
 def reconstruct_response(response_line: str, response_headers: dict[str, str], body: bytes) -> bytes:
+    """Reconstructs response, primarily used if response body updated (compressed)"""
     res = f'{response_line}\r\n'.encode('utf-8')
 
     for header, value in response_headers.items():

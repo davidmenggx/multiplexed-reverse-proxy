@@ -28,7 +28,7 @@ parser.add_argument('-v', '--verbose', action='store_true', default=False, help=
 
 args = parser.parse_args()
 
-# Validate command line arguments:
+# Validate command line arguments
 if not (0 <= args.port <= 65535):
     raise ValueError(f'FATAL: specified port {args.port} does not exist!')
 
@@ -56,6 +56,7 @@ if args.expiration < 0:
 if args.frequency < 0:
     raise ValueError(f'FATAL: Connection pool cleanup frequency cannot be negative! Currently {args.frequency}')
 
+# Server settings
 HOST = ''
 PORT = args.port
 
@@ -169,7 +170,7 @@ def discover_servers() -> None:
                     break
 
                 with conn:
-                    conn.settimeout(2.0) # make sure one server doesn't hang
+                    conn.settimeout(2.0) # Make sure discovery thread does not hang on stalled connection
                     try:
                             data = conn.recv(1024)
                             if not data:
@@ -182,7 +183,7 @@ def discover_servers() -> None:
                                     try:
                                         ip, port = message.split(',')
                                         if ConnectionContext.LOAD_BALANCER:
-                                            ConnectionContext.LOAD_BALANCER._add_server((ip, int(port)))
+                                            ConnectionContext.LOAD_BALANCER.add_server((ip, int(port)))
                                             LOGGER.debug(f'Registered server: {ip}:{port}')
                                     except ValueError:
                                         LOGGER.warning(f"Ignored malformed discovery msg: {message}")
@@ -194,6 +195,7 @@ def discover_servers() -> None:
         LOGGER.critical(f"Discovery thread crashed: {e}")
 
 def cleanup_pool() -> None:
+    """Periodically cleans connection pool for expired connections"""
     while RUNNING:
         time.sleep(args.frequency)
         ConnectionContext.POOL.cleanup()
@@ -208,9 +210,9 @@ def main() -> None:
     while RUNNING:
         events = sel.select(timeout=1.0)
         for key, mask in events:
-            if key.data is None: # the listener has data=None, so when key.data is None, it is a new connection incoming
+            if key.data is None:
                 accept_connection(key.fileobj)
-            else: # otherwise it is a socket that is ready to be processed
+            else:
                 key.data.process_events(mask)
         current_time = time.time()
         for map_key in list(sel.get_map().values()):

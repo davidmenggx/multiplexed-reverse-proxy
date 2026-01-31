@@ -1,8 +1,9 @@
 def parse_request(header: bytes) -> tuple[str, dict[str, str]]: # returns (request top line, headers dict) in original casing
+    """Parses request header, returning (Request line, Headers dict) tuple"""
     request_line_raw = header.split(b'\r\n')[0]
     request_headers_raw_list = header.split(b'\r\n')[1:]
 
-    if len(request_line_raw.split()) != 3: # make sure all three elements of the request line are present
+    if len(request_line_raw.split()) != 3: # Make sure all three elements of the request line are present
         raise ValueError('Parse Error - Request Line')
 
     request_headers_raw_dict = {}

@@ -1,4 +1,5 @@
 def parse_response(header: bytes) -> tuple[str, dict[str, str]]: # returns (response top line, headers dict) in original casing
+    """Parses response header, returning (Response line, Headers dict) tuple"""
     response_line_raw = header.split(b'\r\n')[0]
     response_headers_raw_list = header.split(b'\r\n')[1:]
 
