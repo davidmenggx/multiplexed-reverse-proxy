@@ -5,3 +5,9 @@ key.pem
 sample_client.py
 
 *.log
+
+.venv/
+
+.pytest_cache/
+
+.coverage
