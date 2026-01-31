@@ -49,7 +49,7 @@ class ConnectionPool:
                     sock.close()
         return self._create_connection(addr)
     
-    def release_connection(self, addr: tuple[str, int], sock: socket.socket) -> bool: # boolean flag for success (true) or unsuccessful (false)
+    def release_connection(self, addr: tuple[str, int], sock: socket.socket):
         try:
             with self.pool_lock:
                 if addr in self.pool and len(self.pool[addr]) < self.POOL_MAXSIZE:
@@ -57,10 +57,8 @@ class ConnectionPool:
                     LOGGER.debug(f'Added connection back to pool for server {addr}')
                 else:
                     sock.close()
-                return True
         except Exception:
             sock.close()
-            return False
     
     def cleanup(self) -> None:
         LOGGER.debug('Cleaning up connection pool for expired connections')

@@ -5,6 +5,7 @@ import logging
 import selectors
 from enum import Enum
 
+import responses
 from cache import Cache
 from load_balancer import LoadBalancer
 from connection_pool import ConnectionPool
@@ -13,6 +14,8 @@ from utilities import parse_request, reconstruct_request, parse_response, recons
 LOGGER = logging.getLogger('reverse_proxy')
 
 HEADER_DELIMITER = b'\r\n\r\n'
+
+MAX_HEADER_SIZE = 8192 # 8KB
 
 class ProcessingStates(Enum):
     TLS_HANDSHAKE = 'TLS_HANDSHAKE'
@@ -121,13 +124,25 @@ class ConnectionContext:
             return
         
         if HEADER_DELIMITER in self.request_buffer:
+            if len(self.request_buffer) > MAX_HEADER_SIZE:
+                self.response_buffer = responses.header_too_large()
+                self._set_write_client_state()
+                return
+            
             if not self.request_header_parsed:
                 self._parse_request_headers()
+            
+            if self.state == ProcessingStates.WRITE_CLIENT:
+                    return
 
             total_size = self.request_head_raw_length + len(HEADER_DELIMITER) + self.request_content_length
             if len(self.request_buffer) >= total_size:
                 self._finalize_request_parsing()
-    
+        elif len(self.request_buffer) > MAX_HEADER_SIZE:
+            self.response_buffer = responses.header_too_large()
+            self._set_write_client_state()
+            return
+        
     def _parse_request_headers(self):
         request_head_raw, _, _ = self.request_buffer.partition(HEADER_DELIMITER)
         self.request_head_raw_length = len(request_head_raw)
@@ -135,13 +150,18 @@ class ConnectionContext:
         try:
             self.request_line, self.request_headers = parse_request(request_head_raw)
         except ValueError:
-            self.response_buffer = b'400 bad request'
+            self.response_buffer = responses.bad_request()
             self._set_write_client_state()
             return
 
-        self.method, self.path = self.request_line.split()[:2]
+        self.method, self.path, protocol_version = self.request_line.split()
         self.request_headers_lower = {k.lower(): v.lower() for k, v in self.request_headers.items()}
         self.request_content_length = int(self.request_headers_lower.get('content-length', 0))
+
+        if protocol_version != 'HTTP/1.1':
+            self.response_buffer = responses.http_version_not_supported()
+            self._set_write_client_state()
+            return
 
         self.keepalive = self.request_headers_lower.get('connection') != 'close'
         
@@ -203,7 +223,7 @@ class ConnectionContext:
             LOGGER.debug(f"Retrying backend... ({self._retries})")
             self._init_backend_conn()
         else:
-            self.response_buffer = b'502 bad gateway'
+            self.response_buffer = responses.bad_gateway()
             self._set_write_client_state()
     
     def _write_request(self) -> None:
@@ -215,14 +235,18 @@ class ConnectionContext:
             try:
                 sent = self.backend_sock.send(self.request_buffer) # .send returns the # of bytes sent
                 if not sent:
-                    return # CRITICAL: THIS IS AN ERROR, IT MEANS THE BACKEND HAS NOT BEEN CONNECTED
+                    LOGGER.critical("Failed to write request to backend")
+                    self._close_backend_only()
+                    self.response_buffer = responses.bad_gateway()
+                    self._set_write_client_state()
+                    return
                 self.request_buffer = self.request_buffer[sent:] # so use that info to clear the buffer
             except (BlockingIOError, ssl.SSLWantWriteError):
                 pass
             except (BrokenPipeError, ConnectionResetError):
                 LOGGER.critical("Backend closed connection unexpectedly")
                 self._close_backend_only()
-                self.response_buffer = b'502 bad gateway'
+                self.response_buffer = responses.bad_gateway()
                 self._set_write_client_state()
                 return
         
@@ -236,7 +260,7 @@ class ConnectionContext:
         except BlockingIOError:
             return
         except Exception:
-            self.response_buffer = b'502 bad gateway'
+            self.response_buffer = responses.bad_gateway()
             self._set_write_client_state()
             return
         
@@ -244,7 +268,7 @@ class ConnectionContext:
             self.response_buffer += data
         else:
             if not self.response_header_parsed:
-                self.response_buffer = b'502 bad gateway'
+                self.response_buffer = responses.bad_gateway()
             self._set_write_client_state()
             return
 
@@ -262,7 +286,7 @@ class ConnectionContext:
         try:
             self.response_line, self.response_headers = parse_response(response_head_raw)
         except ValueError:
-            self.response_buffer = b'502 bad gateway'
+            self.response_buffer = responses.bad_gateway()
             self._set_write_client_state()
             return
         
@@ -305,7 +329,8 @@ class ConnectionContext:
             try:
                 sent = self.client_sock.send(self.response_buffer) # .send returns the # of bytes sent
                 if not sent:
-                    return # CRITICAL: THIS IS AN ERROR, IT MEANS THE BACKEND HAS NOT BEEN CONNECTED
+                    self.state = ProcessingStates.CLEANUP
+                    return
                 self.response_buffer = self.response_buffer[sent:] # so use that info to clear the buffer
             except BlockingIOError:
                 pass
@@ -336,17 +361,19 @@ class ConnectionContext:
         registers backend_sock with Selector (WRITE_BACKEND), passing self as data
         pauses client_sock (unregister or remove selectors.EVENT_READ) to stop buffering
         """
-        # use _get_server_one() temporarily, all methods in the load balancer return an (IP, Port) tuple where IP is a str and Port is an int
         try:
             self.backend_addr = ConnectionContext.LOAD_BALANCER.get_server(self.client_addr[0]) # type: ignore
         except (ValueError, ZeroDivisionError):
             LOGGER.critical('Failed to find backend server')
-            self.response_buffer = b'503 service unavailable'
+            self.response_buffer = responses.service_unavailable()
+            self._set_write_client_state()
+            return
+        if not self.backend_addr:
+            LOGGER.critical('Failed to find backend server')
+            self.response_buffer = responses.service_unavailable()
             self._set_write_client_state()
             return
         ConnectionContext.LOAD_BALANCER._increment_connection(self.backend_addr)
-        if not self.backend_addr:
-            ... # CRITICAL: THIS MUST RAISE AN ERROR 503 service unavailable
         
         self.backend_sock = ConnectionContext.POOL.get_connection(self.backend_addr)
         self.state = ProcessingStates.CONNECT_BACKEND
@@ -361,9 +388,7 @@ class ConnectionContext:
         if self.backend_sock:
             try:
                 self.selector.unregister(self.backend_sock)
-                release_successful = self.POOL.release_connection(self.backend_addr, self.backend_sock) # type: ignore
-                if not release_successful:
-                    ... # CRITICAL RETURN SERVER ERROR
+                self.POOL.release_connection(self.backend_addr, self.backend_sock) # type: ignore
             except (KeyError, OSError): 
                 pass
             self.backend_sock = None
@@ -385,9 +410,7 @@ class ConnectionContext:
                     self.selector.unregister(self.backend_sock)
                 except (KeyError, ValueError): 
                     pass
-                release_successful = self.POOL.release_connection(self.backend_addr, self.backend_sock) # type: ignore
-                if not release_successful:
-                    ... # CRITICAL RETURN SERVER ERROR
+                self.POOL.release_connection(self.backend_addr, self.backend_sock) # type: ignore
             if self.backend_addr:
                 ConnectionContext.LOAD_BALANCER._decrement_connection(self.backend_addr)
                 self.backend_addr = None

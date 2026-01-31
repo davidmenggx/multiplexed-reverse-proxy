@@ -11,3 +11,5 @@ sample_client.py
 .pytest_cache/
 
 .coverage
+
+.vscode/
